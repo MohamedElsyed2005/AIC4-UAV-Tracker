@@ -472,6 +472,10 @@ def main():
     # ── Model ──────────────────────────────────────────────────────────────
     logger.info("Building model …")
     model = build_hit_tracker().to(device)
+
+    # Freeze backbone during warmup (pretrained stability)
+    logger.info("[freeze] Freezing backbone for warmup epochs")
+    model.freeze_backbone()
     params = model.param_count()
     logger.info(
         "  Total params: %.3fM  (backbone %.2fM  transformer %.2fM  head %.2fM)",
@@ -482,12 +486,7 @@ def main():
     )
 
     # ── Pretrained backbone ────────────────────────────────────────────────
-    if args.pretrained_backbone == "timm":
-        _try_load_timm_backbone(model, logger)
-    elif args.pretrained_backbone == "imagenet" and args.backbone_ckpt:
-        _load_backbone_checkpoint(model, args.backbone_ckpt, logger)
-    else:
-        logger.info("[pretrained] Training backbone from scratch.")
+    logger.info("[pretrained] Using timm pretrained backbone (built-in).")  
 
     # ── Optimiser — separate LR for backbone vs head/transformer ──────────
     # Backbone already has good features from ImageNet; train it at 10× lower LR.
@@ -536,6 +535,11 @@ def main():
     logger.info("=" * 60)
 
     for epoch in range(start_epoch, args.epochs):
+        # Unfreeze backbone after warmup
+        if epoch == args.warmup_epochs:
+            logger.info("[freeze] Unfreezing backbone")
+            model.unfreeze_backbone()
+            
         current_lr = optimizer.param_groups[1]["lr"]   # non-backbone group
         logger.info(
             "\n── Epoch %d/%d  lr=%.2e ──",

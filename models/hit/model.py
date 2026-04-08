@@ -51,10 +51,6 @@ class HiTConfig:
     backbone_out_channels: int = 96
     backbone_stride:       int = 16
 
-    # Pretrained backbone  ('timm' | 'local' | 'none')
-    pretrained_backbone: str         = "timm"
-    backbone_ckpt:       Optional[str] = None    # path for source='local'
-
     @property
     def template_hw(self): return self.template_size // self.backbone_stride  # 8
     @property
@@ -102,11 +98,7 @@ class HiTTracker(nn.Module):
         cfg = self.cfg
 
         # ── Build backbone (with optional pretrained weights) ──────────────
-        self.backbone = MobileViTBackbone.pretrained(
-            source    = cfg.pretrained_backbone
-                        if cfg.pretrained_backbone != "none" else None,
-            ckpt_path = cfg.backbone_ckpt,
-        )
+        self.backbone = MobileViTBackbone()
 
         self.transformer = CrossAttentionTransformer(
             in_channels = cfg.backbone_out_channels,

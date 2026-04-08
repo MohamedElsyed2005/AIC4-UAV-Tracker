@@ -19,6 +19,7 @@ Changes vs v1
 """
 
 import torch
+import timm
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
@@ -149,68 +150,46 @@ class MobileViTBlock(nn.Module):
 
 class MobileViTBackbone(nn.Module):
     """
-    MobileViT-XS backbone for UAV tracking.
+    MobileViT-XS Backbone using timm pretrained weights (ImageNet).
 
-    Architecture:  Stem → Stage1-5 → neck upsample
-    Output stride: 16
-    Output channels: 96
-    Parameters: ~2.3M
+    This replaces the custom implementation to ensure 100% compatibility
+    with pretrained weights from timm.
+
+    Output:
+        - Channels: 96
+        - Stride: 16
     """
 
-    def __init__(self, in_ch=3, dropout=0.0):
+    def __init__(self, in_ch=3):
         super().__init__()
 
-        self.stem   = ConvBNAct(in_ch, 16, stride=2)
-
-        self.stage1 = nn.Sequential(
-            InvertedResidual(16, 32, stride=1, expand_ratio=4),
-        )
-        self.stage2 = nn.Sequential(
-            InvertedResidual(32, 48, stride=2, expand_ratio=4),
-            InvertedResidual(48, 48, stride=1, expand_ratio=4),
-            InvertedResidual(48, 48, stride=1, expand_ratio=4),
-        )
-        self.stage3 = nn.Sequential(
-            InvertedResidual(48, 64, stride=2, expand_ratio=4),
-            MobileViTBlock(64, dim=96,  patch_size=2, depth=2, heads=1),
-        )
-        self.stage4 = nn.Sequential(
-            InvertedResidual(64, 80, stride=2, expand_ratio=4),
-            MobileViTBlock(80, dim=120, patch_size=2, depth=4, heads=2),
-        )
-        self.stage5 = nn.Sequential(
-            InvertedResidual(80, 96, stride=2, expand_ratio=4),
-            MobileViTBlock(96, dim=144, patch_size=2, depth=3, heads=2),
-        )
-        self.neck = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            ConvBNAct(96, 96, kernel=1, padding=0),
+        # Load pretrained MobileViT-XS from timm
+        self.backbone = timm.create_model(
+            "mobilevit_xs",
+            pretrained=True,
+            features_only=True  # <-- IMPORTANT
         )
 
-        self._init_weights()
+        # Get number of channels from last feature map
+        in_channels = self.backbone.feature_info[-1]["num_chs"]
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                nn.init.trunc_normal_(m.weight, std=0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        # Adapter to match expected 96 channels
+        self.adapter = nn.Sequential(
+            nn.Conv2d(in_channels, 96, kernel_size=1, bias=False),
+            nn.BatchNorm2d(96),
+            nn.ReLU(inplace=True),
+        )
 
     def forward(self, x):
-        x = self.stem(x)
-        x = self.stage1(x)
-        x = self.stage2(x)
-        x = self.stage3(x)
-        x = self.stage4(x)
-        x = self.stage5(x)
-        x = self.neck(x)
+        # Extract feature maps
+        features = self.backbone(x)
+
+        # Take last stage output
+        x = features[-1]
+
+        # Convert to 96 channels
+        x = self.adapter(x)
+
         return x
 
     @property
@@ -220,98 +199,6 @@ class MobileViTBackbone(nn.Module):
     @property
     def stride(self):
         return 16
-
-    # ── v2: pretrained loading ────────────────────────────────────────────
-
-    def load_from_timm(self) -> bool:
-        """
-        Load matching weights from timm's mobilevit_xs (ImageNet pretrained).
-        Returns True if at least 50% of layers matched.
-
-        HOW IT WORKS:
-          timm mobilevit_xs and our MobileViTBackbone share the same Conv/BN
-          naming convention in their stem, stage1-stage5 blocks.  We match by
-          layer name AND shape — any mismatch is silently skipped.  The neck
-          (our custom upsample+conv) never matches and starts from scratch.
-        """
-        try:
-            import timm
-            ref = timm.create_model("mobilevit_xs", pretrained=True, num_classes=0)
-        except ImportError:
-            return False
-        except Exception:
-            return False
-
-        ref_state = ref.state_dict()
-        our_state = self.state_dict()
-        matched   = {}
-
-        for k, v in ref_state.items():
-            if k in our_state and our_state[k].shape == v.shape:
-                matched[k] = v
-
-        if len(matched) < len(our_state) * 0.5:
-            # Less than 50% matched — likely a different architecture version
-            del ref
-            return False
-
-        self.load_state_dict(matched, strict=False)
-        del ref
-        return True
-
-    def load_from_checkpoint(self, path: str) -> bool:
-        """Load backbone weights from a local checkpoint."""
-        if not __import__("os").path.exists(path):
-            return False
-        ckpt  = torch.load(path, map_location="cpu")
-        state = ckpt.get("model_state", ckpt.get("state_dict", ckpt))
-        # Strip common prefixes
-        cleaned = {}
-        for k, v in state.items():
-            for prefix in ("backbone.", "model.backbone.", ""):
-                if k.startswith(prefix):
-                    cleaned[k[len(prefix):]] = v
-                    break
-        missing, unexpected = self.load_state_dict(cleaned, strict=False)
-        return len(missing) < len(self.state_dict()) * 0.5
-
-    def freeze(self):
-        """Freeze all backbone parameters (use during early warmup)."""
-        for p in self.parameters():
-            p.requires_grad_(False)
-
-    def unfreeze(self):
-        """Unfreeze all backbone parameters."""
-        for p in self.parameters():
-            p.requires_grad_(True)
-
-    @classmethod
-    def pretrained(
-        cls,
-        source: Optional[str] = "timm",
-        ckpt_path: Optional[str] = None,
-        **kwargs,
-    ) -> "MobileViTBackbone":
-        """
-        Build backbone and optionally load pretrained weights.
-
-        Args:
-            source:    'timm' | 'local' | None
-            ckpt_path: path to local .pth when source='local'
-        """
-        bb = cls(**kwargs)
-        if source == "timm":
-            ok = bb.load_from_timm()
-            if not ok:
-                import warnings
-                warnings.warn(
-                    "MobileViTBackbone: timm load failed — using random init. "
-                    "Install timm: pip install timm --break-system-packages"
-                )
-        elif source == "local" and ckpt_path:
-            bb.load_from_checkpoint(ckpt_path)
-        return bb
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utilities
