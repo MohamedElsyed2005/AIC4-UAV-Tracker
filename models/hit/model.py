@@ -129,14 +129,23 @@ class HiTTracker(nn.Module):
     def freeze_backbone(self):
         """
         Freeze backbone parameters.
-        Call for warmup epochs when using pretrained weights so the
-        randomly-initialised transformer head doesn't corrupt the backbone.
         """
-        self.backbone.freeze()
+        if hasattr(self.backbone, "freeze"):
+            self.backbone.freeze()
+        else:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+
 
     def unfreeze_backbone(self):
-        """Unfreeze backbone for fine-tuning."""
-        self.backbone.unfreeze()
+        """
+        Unfreeze backbone parameters.
+        """
+        if hasattr(self.backbone, "unfreeze"):
+            self.backbone.unfreeze()
+        else:
+            for param in self.backbone.parameters():
+                param.requires_grad = True
 
     # ── Optimiser helper ──────────────────────────────────────────────────
 

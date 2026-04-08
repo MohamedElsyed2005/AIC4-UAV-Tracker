@@ -171,7 +171,7 @@ class MobileViTBackbone(nn.Module):
         )
 
         # Get number of channels from last feature map
-        in_channels = self.backbone.feature_info[-1]["num_chs"]
+        in_channels = self.backbone.feature_info[-2]["num_chs"]
 
         # Adapter to match expected 96 channels
         self.adapter = nn.Sequential(
@@ -185,12 +185,50 @@ class MobileViTBackbone(nn.Module):
         features = self.backbone(x)
 
         # Take last stage output
-        x = features[-1]
-
+        x = features[-2]   
+        
         # Convert to 96 channels
         x = self.adapter(x)
-
         return x
+    
+    def freeze(self):
+        """
+        Freeze all backbone parameters.
+        """
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def unfreeze(self):
+        """
+        Unfreeze all backbone parameters.
+        """
+        for param in self.parameters():
+            param.requires_grad = True
+
+    @classmethod
+    def pretrained(cls, source: Optional[str] = "timm", ckpt_path: Optional[str] = None):
+        """
+        Factory method to build backbone with optional pretrained weights.
+        """
+        model = cls()
+
+        if source is None or source == "none":
+            return model
+
+        if source == "timm":
+            # already loaded by timm in __init__
+            return model
+
+        if source == "local":
+            if ckpt_path is None:
+                raise ValueError("ckpt_path must be provided for local pretrained")
+
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+            state = ckpt.get("model_state", ckpt.get("state_dict", ckpt))
+            model.load_state_dict(state, strict=False)
+            return model
+
+        raise ValueError(f"Unknown pretrained source: {source}")
 
     @property
     def out_channels(self):
