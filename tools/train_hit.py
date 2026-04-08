@@ -49,6 +49,7 @@ import math
 import os
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import torch
@@ -61,6 +62,32 @@ sys.path.insert(0, str(_ROOT))
 
 from data.dataset        import TrainingDataset
 from models.hit.model    import build_hit_tracker, HiTConfig
+
+# Suppress ffmpeg "moov atom not found" stderr noise that leaks from
+# corrupted/incomplete video files in the dataset.  The dataset's own
+# __getitem__ already handles these by returning None; we just don't
+# want the low-level C library spamming the console.
+os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")   # for cv2 builds
+import ctypes, ctypes.util
+try:
+    _av = ctypes.util.find_library("avformat")
+    if _av:
+        ctypes.CDLL(_av)   # ensure loaded so av_log_set_level works
+    ctypes.cdll.LoadLibrary("libavformat.so.59").av_log_set_level(24)  # AV_LOG_ERROR
+except Exception:
+    pass  # non-critical – silencing is best-effort
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Collate: skip None samples returned by the dataset for broken video files
+# ─────────────────────────────────────────────────────────────────────────────
+
+def safe_collate(batch):
+    """Filter out None items (corrupt/missing frames) before stacking."""
+    batch = [b for b in batch if b is not None]
+    if not batch:
+        return None   # handled in the training loop
+    return torch.utils.data.dataloader.default_collate(batch)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -165,6 +192,10 @@ def train_one_epoch(model, loader, optimizer, scaler, device,
     t_start      = time.time()
 
     for batch_idx, batch in enumerate(loader):
+        # safe_collate returns None when an entire batch is corrupted — skip it.
+        if batch is None:
+            continue
+
         template = batch["template"].to(device, non_blocking=True)  # (B,3,128,128)
         search   = batch["search"].to(device, non_blocking=True)    # (B,3,256,256)
         gt_boxes = batch["gt_box"].to(device, non_blocking=True)    # (B,4)
@@ -172,8 +203,8 @@ def train_one_epoch(model, loader, optimizer, scaler, device,
         # set_to_none=True is faster than zeroing — skips the memset entirely.
         optimizer.zero_grad(set_to_none=True)
 
-        # Forward + loss under AMP
-        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+        # Forward + loss under AMP. Use new torch.amp API (torch >= 2.1).
+        with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
             output = model(template, search)
             losses = model.compute_loss(output, gt_boxes)
 
@@ -232,11 +263,14 @@ def validate(model, loader, device):
     n_batches   = 0
 
     for batch in loader:
+        if batch is None:
+            continue
+
         template = batch["template"].to(device, non_blocking=True)
         search   = batch["search"].to(device, non_blocking=True)
         gt_boxes = batch["gt_box"].to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+        with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
             output = model(template, search)
             losses = model.compute_loss(output, gt_boxes)
 
@@ -321,6 +355,8 @@ def main():
         persistent_workers = (args.num_workers > 0),
         # Pre-fetch next batch while GPU processes current one.
         prefetch_factor    = 2 if args.num_workers > 0 else None,
+        # Skip None items from corrupted video files gracefully.
+        collate_fn         = safe_collate,
     )
     val_loader = DataLoader(
         val_ds,
@@ -330,6 +366,7 @@ def main():
         pin_memory         = (device.type == "cuda"),
         persistent_workers = (args.num_workers > 0),
         prefetch_factor    = 2 if args.num_workers > 0 else None,
+        collate_fn         = safe_collate,
     )
 
     logger.info(f"  Train: {len(train_ds)} samples/epoch  "
@@ -360,8 +397,8 @@ def main():
             ep, args.warmup_epochs, args.epochs)
     )
 
-    # AMP scaler (no-op on CPU)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    # AMP scaler (no-op on CPU). Use new torch.amp API (torch >= 2.1).
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     # ── Resume ─────────────────────────────────────────────────────────────
     start_epoch   = 0
