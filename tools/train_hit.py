@@ -7,14 +7,26 @@ Usage:
     # From project root:
     python tools/train_hit.py
 
-    # Custom config:
+    # Colab (T4) config:
     python tools/train_hit.py \
         --manifest data/contest_release/metadata/contestant_manifest.json \
         --data_root data/contest_release \
-        --output_dir output/hit_run1 \
+        --output_dir /content/drive/MyDrive/hit_run1 \
         --epochs 50 \
-        --batch_size 16 \
-        --lr 1e-4
+        --batch_size 32 \
+        --num_workers 2 \
+        --lr 2e-4
+
+    # Colab (A100) config:
+    python tools/train_hit.py \
+        --output_dir /content/drive/MyDrive/hit_run1 \
+        --batch_size 64 \
+        --num_workers 2 \
+        --lr 4e-4
+
+    # Resume after Colab session disconnect:
+    python tools/train_hit.py \
+        --resume /content/drive/MyDrive/hit_run1/latest.pth
 
 Training strategy:
   - AdamW optimizer with cosine LR schedule + linear warmup
@@ -22,6 +34,13 @@ Training strategy:
   - Gradient clipping (max norm 0.1) for stable transformer training
   - Best checkpoint saved by validation loss
   - Full log written to output_dir/train.log
+
+Colab optimizations applied:
+  - num_workers default lowered to 2 (Colab has 2 CPU cores only)
+  - batch_size default raised to 32 (fits T4 16GB VRAM)
+  - lr default scaled to 2e-4 (linear scaling with larger batch)
+  - DataLoader uses persistent_workers + prefetch_factor=2
+  - output_dir defaults to Drive path to survive session resets
 """
 
 import argparse
@@ -58,20 +77,27 @@ def parse_args():
         default=str(_ROOT / "data/contest_release"))
 
     # Output
-    p.add_argument("--output_dir",
-        default=str(_ROOT / "output/hit_run1"))
+    # Default to Google Drive so checkpoints survive Colab session resets.
+    # Falls back to local output/ if Drive is not mounted.
+    _drive_out = "/content/drive/MyDrive/hit_run1"
+    _local_out = str(_ROOT / "output/hit_run1")
+    _default_out = _drive_out if os.path.isdir("/content/drive/MyDrive") else _local_out
+    p.add_argument("--output_dir", default=_default_out)
     p.add_argument("--resume", default=None,
         help="Path to checkpoint .pth to resume from")
 
     # Training hyper-params
-    p.add_argument("--epochs",          type=int,   default=50)
-    p.add_argument("--batch_size",      type=int,   default=16)
-    p.add_argument("--num_workers",     type=int,   default=4)
-    p.add_argument("--samples_per_epoch", type=int, default=4000)
-    p.add_argument("--val_samples",     type=int,   default=500)
+    p.add_argument("--epochs",            type=int,   default=50)
+    # 32 fills ~12 GB of T4 VRAM comfortably; raise to 64 on A100.
+    p.add_argument("--batch_size",        type=int,   default=32)
+    # Colab gives 2 CPU cores — more workers just starve each other.
+    p.add_argument("--num_workers",       type=int,   default=2)
+    p.add_argument("--samples_per_epoch", type=int,   default=4000)
+    p.add_argument("--val_samples",       type=int,   default=500)
 
     # Optimiser
-    p.add_argument("--lr",              type=float, default=1e-4)
+    # lr scaled linearly with batch_size: 1e-4 * (32/16) = 2e-4
+    p.add_argument("--lr",              type=float, default=2e-4)
     p.add_argument("--weight_decay",    type=float, default=1e-4)
     p.add_argument("--grad_clip",       type=float, default=0.1)
     p.add_argument("--warmup_epochs",   type=int,   default=5)
@@ -143,7 +169,8 @@ def train_one_epoch(model, loader, optimizer, scaler, device,
         search   = batch["search"].to(device, non_blocking=True)    # (B,3,256,256)
         gt_boxes = batch["gt_box"].to(device, non_blocking=True)    # (B,4)
 
-        optimizer.zero_grad()
+        # set_to_none=True is faster than zeroing — skips the memset entirely.
+        optimizer.zero_grad(set_to_none=True)
 
         # Forward + loss under AMP
         with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
@@ -263,6 +290,8 @@ def main():
     logger.info(f"Device: {device}")
     if device.type == "cuda":
         logger.info(f"  GPU: {torch.cuda.get_device_name(0)}")
+        # Let cuDNN auto-tune the fastest conv kernels for fixed input sizes.
+        torch.backends.cudnn.benchmark = True
 
     # ── Datasets ───────────────────────────────────────────────────────────
     logger.info("Building datasets …")
@@ -283,18 +312,24 @@ def main():
 
     train_loader = DataLoader(
         train_ds,
-        batch_size  = args.batch_size,
-        shuffle     = True,
-        num_workers = args.num_workers,
-        pin_memory  = (device.type == "cuda"),
-        drop_last   = True,
+        batch_size         = args.batch_size,
+        shuffle            = True,
+        num_workers        = args.num_workers,
+        pin_memory         = (device.type == "cuda"),
+        drop_last          = True,
+        # Keep worker processes alive between epochs (saves ~2-3s/epoch).
+        persistent_workers = (args.num_workers > 0),
+        # Pre-fetch next batch while GPU processes current one.
+        prefetch_factor    = 2 if args.num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size  = args.batch_size,
-        shuffle     = False,
-        num_workers = args.num_workers,
-        pin_memory  = (device.type == "cuda"),
+        batch_size         = args.batch_size,
+        shuffle            = False,
+        num_workers        = args.num_workers,
+        pin_memory         = (device.type == "cuda"),
+        persistent_workers = (args.num_workers > 0),
+        prefetch_factor    = 2 if args.num_workers > 0 else None,
     )
 
     logger.info(f"  Train: {len(train_ds)} samples/epoch  "
