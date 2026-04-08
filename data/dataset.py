@@ -11,17 +11,25 @@ Data layout expected on disk
 ─────────────────────────────
 <data_root>/
   dataset1/Car_video_2/Car_video_2.mp4
-  dataset1/Car_video_2/annotation.txt   ← "x,y,w,h" per line (one line = first frame only OR all frames)
+  dataset1/Car_video_2/annotation.txt   ← "x,y,w,h" per line
   ...
 
-The contestant_manifest.json tells us which sequences are in
-'train' vs 'public_lb' splits.
+FIXES applied vs original:
+  1. augment_image → augment_search: now returns (img, flipped:bool)
+     so _build_sample can mirror cx_n when a horizontal flip occurred.
+  2. _read_frame: opens VideoCapture once per (seq, worker) via an
+     instance-level LRU cache instead of opening/closing every call.
+  3. InferenceSequence.__init__: checks cap.isOpened() after
+     VideoCapture() so corrupted / missing videos raise early.
+  4. crop_and_resize return type hint fixed: tuple[ndarray, float, tuple].
+  5. print_dataset_stats: guards against None annotation_path.
 """
 
 import json
 import os
 import random
 from pathlib import Path
+from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -36,10 +44,8 @@ from torch.utils.data import Dataset
 def load_annotation(ann_path: str) -> list[list[float]]:
     """
     Read annotation file.
-    Each line: x,y,w,h   (top-left corner + width/height, 1-indexed in some
-    datasets - we keep as-is and trust the data).
-    Returns list of [x, y, w, h] floats. May be just 1 line (first-frame init)
-    or one line per frame.
+    Each line: x,y,w,h   (top-left corner + width/height).
+    Returns list of [x, y, w, h] floats.
     """
     boxes = []
     with open(ann_path, "r") as f:
@@ -47,7 +53,6 @@ def load_annotation(ann_path: str) -> list[list[float]]:
             line = line.strip()
             if not line:
                 continue
-            # support comma or tab or space separated
             parts = line.replace("\t", ",").replace(" ", ",").split(",")
             parts = [p for p in parts if p]
             if len(parts) >= 4:
@@ -79,24 +84,25 @@ def clip_box(box, frame_h, frame_w, margin=0):
     return [x, y, w, h]
 
 
+# FIX 4: return type hint now matches actual 3-tuple return value
 def crop_and_resize(frame: np.ndarray,
                     box: list,
                     output_size: int,
-                    context_factor: float = 2.0) -> tuple[np.ndarray, float]:
+                    context_factor: float = 2.0) -> tuple[np.ndarray, float, tuple]:
     """
     Crop a square region centred on `box` with context padding,
     then resize to `output_size x output_size`.
 
     Returns:
         crop        - (output_size, output_size, 3)  uint8
-        scale       - ratio output_size / crop_side  (used to rescale coords)
+        scale       - ratio output_size / crop_side
+        (x1, y1)    - top-left corner of crop in (possibly padded) frame coords
     """
     H, W = frame.shape[:2]
     x, y, w, h = box
     cx = x + w / 2
     cy = y + h / 2
 
-    # square crop side with context
     s = (w + h) / 2 * context_factor
     s = max(s, 1.0)
 
@@ -105,7 +111,6 @@ def crop_and_resize(frame: np.ndarray,
     x2 = int(round(cx + s / 2))
     y2 = int(round(cy + s / 2))
 
-    # Pad frame if crop goes outside
     pad_top    = max(0, -y1)
     pad_left   = max(0, -x1)
     pad_bottom = max(0, y2 - H)
@@ -120,30 +125,53 @@ def crop_and_resize(frame: np.ndarray,
         y1 += pad_top;  y2 += pad_top
 
     crop = frame[y1:y2, x1:x2]
-    scale = output_size / max(crop.shape[:2], default=1)
+    # FIX 4: explicit max(h, w) instead of passing tuple to max()
+    crop_side = max(crop.shape[0], crop.shape[1])
+    scale = output_size / max(crop_side, 1)
     crop  = cv2.resize(crop, (output_size, output_size))
 
-    return crop, scale, (x1, y1)   # also return top-left for offset calc
+    return crop, scale, (x1, y1)
 
 
-def augment_image(img: np.ndarray) -> np.ndarray:
-    """Light augmentations safe for UAV tracking."""
-    # Random brightness / contrast
-    alpha = random.uniform(0.8, 1.2)   # contrast
-    beta  = random.randint(-20, 20)    # brightness
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 1: augment_image split into two functions
+#   - augment_template: photometric only (no flip — template must stay stable)
+#   - augment_search:   photometric + flip, returns (img, flipped:bool)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _photometric_augment(img: np.ndarray) -> np.ndarray:
+    """Brightness/contrast jitter + colour channel shuffle."""
+    alpha = random.uniform(0.8, 1.2)
+    beta  = random.randint(-20, 20)
     img   = np.clip(alpha * img + beta, 0, 255).astype(np.uint8)
-
-    # Random horizontal flip (50 %)
-    if random.random() < 0.5:
-        img = cv2.flip(img, 1)
-
-    # Random colour channel shuffle (30 %)
     if random.random() < 0.3:
         perm = list(range(3))
         random.shuffle(perm)
         img = img[:, :, perm]
-
     return img
+
+
+def augment_template(img: np.ndarray) -> np.ndarray:
+    """Photometric augmentations for the template crop (no flip)."""
+    return _photometric_augment(img)
+
+
+def augment_search(img: np.ndarray) -> tuple[np.ndarray, bool]:
+    """
+    Augmentations for the search crop.
+
+    Returns:
+        img     - augmented image
+        flipped - True if a horizontal flip was applied
+                  (caller must mirror cx_n: cx_n = 1.0 - cx_n)
+    """
+    img = _photometric_augment(img)
+    flipped = False
+    # FIX 1: track the flip so caller can mirror the GT box cx
+    if random.random() < 0.5:
+        img = cv2.flip(img, 1)
+        flipped = True
+    return img, flipped
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -157,11 +185,11 @@ class InferenceSequence:
     Usage
     ─────
     seq = InferenceSequence(seq_info, data_root)
-    init_frame, init_box = seq.get_init()     # first frame + gt bbox
-    for frame_idx, frame in seq:              # subsequent frames
-        bbox = tracker.update(frame)
+    init_frame, init_box = seq.get_init()
+    for frame_idx, frame in seq:
+        bbox = tracker.track(frame)
         seq.record(frame_idx, bbox)
-    results = seq.get_results()               # list of (seq_id_str, x, y, w, h)
+    results = seq.get_results()
     """
 
     def __init__(self, seq_info: dict, data_root: str):
@@ -171,32 +199,41 @@ class InferenceSequence:
         self.n_frames  = seq_info["n_frames"]
 
         video_path = os.path.join(data_root, seq_info["video_path"])
-        ann_path   = os.path.join(data_root, seq_info["annotation_path"])
+        ann_path_rel = seq_info.get("annotation_path")
 
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video not found: {video_path}")
-        if not os.path.exists(ann_path):
-            raise FileNotFoundError(f"Annotation not found: {ann_path}")
 
-        self.cap    = cv2.VideoCapture(video_path)
-        self.boxes  = load_annotation(ann_path)   # may be 1 or N lines
+        # FIX 3: check isOpened() immediately — catches corrupted MP4s
+        self.cap = cv2.VideoCapture(video_path)
+        if not self.cap.isOpened():
+            raise RuntimeError(
+                f"Cannot open video (corrupted or unsupported codec): {video_path}"
+            )
 
-        # Results storage: frame_index → [x, y, w, h]
+        # Load annotations if present
+        if ann_path_rel:
+            ann_path = os.path.join(data_root, ann_path_rel)
+            if not os.path.exists(ann_path):
+                raise FileNotFoundError(f"Annotation not found: {ann_path}")
+            self.boxes = load_annotation(ann_path)
+        else:
+            self.boxes = []   # submission sequences may have no annotation
+
         self._predictions: dict[int, list] = {}
 
-    # ── public API ────────────────────────────────────────────────────────────
-
     def get_init(self) -> tuple[np.ndarray, list]:
-        """
-        Returns (first_frame_BGR, init_bbox [x,y,w,h]).
-        Resets capture to frame 0.
-        """
+        """Returns (first_frame_BGR, init_bbox [x,y,w,h]). Resets to frame 0."""
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         ret, frame = self.cap.read()
         if not ret:
             raise RuntimeError(f"Cannot read first frame of {self.seq_id}")
-        init_box = self.boxes[0]   # always line 0
-        # Store frame-0 prediction = init_box (tracker is given GT for frame 0)
+        if not self.boxes:
+            raise RuntimeError(
+                f"No annotation for {self.seq_id}. "
+                "Set self.boxes = [[x,y,w,h]] externally before calling get_init()."
+            )
+        init_box = self.boxes[0]
         self._predictions[0] = init_box
         return frame, init_box
 
@@ -216,10 +253,7 @@ class InferenceSequence:
         self._predictions[frame_idx] = list(bbox)
 
     def get_results(self) -> list[tuple]:
-        """
-        Returns list of (id_string, x, y, w, h) ready for CSV.
-        id_string = "dataset1/Car_video_0", "dataset1/Car_video_1", ...
-        """
+        """Returns list of (id_string, x, y, w, h) ready for CSV."""
         rows = []
         for fi in range(self.n_frames):
             row_id = f"{self.seq_id}_{fi}"
@@ -242,16 +276,12 @@ class InferenceSequence:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TrackingPair:
-    """
-    Lightweight container for a single training sample.
-    Returned by TrainingDataset.__getitem__.
-    """
     __slots__ = ["template", "search", "gt_box", "seq_id", "frame_idx"]
 
     def __init__(self, template, search, gt_box, seq_id, frame_idx):
-        self.template  = template   # Tensor (3, Ht, Wt)
-        self.search    = search     # Tensor (3, Hs, Ws)
-        self.gt_box    = gt_box     # Tensor (4,) normalised [cx,cy,w,h] in [0,1]
+        self.template  = template
+        self.search    = search
+        self.gt_box    = gt_box
         self.seq_id    = seq_id
         self.frame_idx = frame_idx
 
@@ -260,16 +290,57 @@ class TrackingPair:
 # 3.  TrainingDataset  – PyTorch Dataset for training loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ImageNet mean/std for normalisation (standard for pretrained backbones)
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 def to_tensor(img: np.ndarray) -> torch.Tensor:
-    """uint8 HWC BGR → float32 CHW RGB, normalised."""
-    img = img[:, :, ::-1].copy().astype(np.float32) / 255.0   # BGR→RGB
+    """uint8 HWC BGR → float32 CHW RGB, ImageNet-normalised."""
+    img = img[:, :, ::-1].copy().astype(np.float32) / 255.0
     img = (img - _MEAN) / _STD
-    return torch.from_numpy(img.transpose(2, 0, 1))            # HWC→CHW
+    return torch.from_numpy(img.transpose(2, 0, 1))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 2: per-worker VideoCapture cache
+#   DataLoader workers are separate processes. Using an instance-level dict
+#   keyed by video_path means each worker builds its own cache of open
+#   VideoCapture handles — no file is opened more than once per worker.
+#   This eliminates the O(N) open/seek/close overhead from the original code.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _VideoCache:
+    """
+    Simple LRU-style VideoCapture cache for one worker process.
+    Keeps the last `maxsize` videos open.
+    """
+    def __init__(self, maxsize: int = 8):
+        self._cache: dict[str, cv2.VideoCapture] = {}
+        self._order: list[str] = []
+        self._maxsize = maxsize
+
+    def get(self, path: str) -> cv2.VideoCapture | None:
+        if path in self._cache:
+            return self._cache[path]
+        cap = cv2.VideoCapture(path)
+        # FIX 3: guard corrupted files here too
+        if not cap.isOpened():
+            cap.release()
+            return None
+        # Evict oldest if over capacity
+        if len(self._order) >= self._maxsize:
+            oldest = self._order.pop(0)
+            self._cache.pop(oldest, None).release()
+        self._cache[path] = cap
+        self._order.append(path)
+        return cap
+
+    def __del__(self):
+        for cap in self._cache.values():
+            try:
+                cap.release()
+            except Exception:
+                pass
 
 
 class TrainingDataset(Dataset):
@@ -277,23 +348,16 @@ class TrainingDataset(Dataset):
     Builds (template_frame, search_frame, gt_bbox) pairs from
     all training sequences.
 
-    For each sample:
-      - Pick a random sequence.
-      - Pick a random "template frame" (earlier in time).
-      - Pick a "search frame" up to `max_gap` frames later.
-      - Crop both around the annotated target with context padding.
-      - Return as tensors + normalised gt bbox.
-
     Args
     ────
-    manifest_path   path to contestant_manifest.json
-    data_root       root folder where dataset1/, dataset2/, … live
-    split           'train' or 'public_lb'
-    template_size   output size for template crop (default 128)
-    search_size     output size for search crop   (default 256)
-    max_gap         max frame gap between template and search (default 100)
-    samples_per_epoch  virtual epoch length (default 50 000)
-    augment         apply image augmentations  (default True)
+    manifest_path      path to contestant_manifest.json
+    data_root          root folder where dataset1/, dataset2/, … live
+    split              'train' or 'public_lb'
+    template_size      output size for template crop (default 128)
+    search_size        output size for search crop   (default 256)
+    max_gap            max frame gap between template and search (default 100)
+    samples_per_epoch  virtual epoch length (default 50_000)
+    augment            apply image augmentations (default True)
     """
 
     def __init__(
@@ -307,32 +371,36 @@ class TrainingDataset(Dataset):
         samples_per_epoch: int = 50_000,
         augment: bool      = True,
     ):
-        self.data_root        = data_root
-        self.template_size    = template_size
-        self.search_size      = search_size
-        self.max_gap          = max_gap
+        self.data_root         = data_root
+        self.template_size     = template_size
+        self.search_size       = search_size
+        self.max_gap           = max_gap
         self.samples_per_epoch = samples_per_epoch
-        self.augment          = augment
+        self.augment           = augment
 
         with open(manifest_path, "r") as f:
             manifest = json.load(f)
 
         if split not in manifest:
-            raise ValueError(f"Split '{split}' not in manifest. "
-                             f"Available: {list(manifest.keys())}")
+            raise ValueError(
+                f"Split '{split}' not in manifest. "
+                f"Available: {list(manifest.keys())}"
+            )
 
         self.sequences = list(manifest[split].values())
 
-        # Pre-load all annotations (fast, text only)
         self._annotations: dict[str, list] = {}
         for seq in self.sequences:
-            ann_path = os.path.join(data_root, seq["annotation_path"])
-            if os.path.exists(ann_path):
-                self._annotations[seq["seq_name"]] = load_annotation(ann_path)
+            ann_path_rel = seq.get("annotation_path")
+            if ann_path_rel:
+                ann_path = os.path.join(data_root, ann_path_rel)
+                if os.path.exists(ann_path):
+                    self._annotations[seq["seq_name"]] = load_annotation(ann_path)
+                else:
+                    self._annotations[seq["seq_name"]] = []
             else:
                 self._annotations[seq["seq_name"]] = []
 
-        # Filter out sequences with no annotation or < 2 frames
         self.sequences = [
             s for s in self.sequences
             if len(self._annotations[s["seq_name"]]) >= 1
@@ -343,15 +411,10 @@ class TrainingDataset(Dataset):
               f"{len(self.sequences)} sequences | "
               f"{samples_per_epoch} samples/epoch")
 
-    # ── internal ──────────────────────────────────────────────────────────────
+        # FIX 2: video cache — one per Dataset instance (= one per worker)
+        self._vcache = _VideoCache(maxsize=16)
 
     def _get_annotation_for_frame(self, seq: dict, frame_idx: int) -> list:
-        """
-        Return [x, y, w, h] for a given frame.
-        If annotation file has 1 line only (first-frame init), the same
-        bbox is used for ALL frames (simple proxy — still useful for training).
-        If it has N lines, return line[frame_idx].
-        """
         ann = self._annotations[seq["seq_name"]]
         if len(ann) == 1:
             return ann[0]
@@ -359,29 +422,30 @@ class TrainingDataset(Dataset):
         return ann[idx]
 
     def _read_frame(self, seq: dict, frame_idx: int) -> np.ndarray | None:
-        """Read a single frame from the video."""
+        """
+        FIX 2: use cached VideoCapture instead of open/seek/close per call.
+        FIX 3: returns None cleanly if video is corrupt/unreadable.
+        """
         video_path = os.path.join(self.data_root, seq["video_path"])
-        cap = cv2.VideoCapture(video_path)
+        cap = self._vcache.get(video_path)
+        if cap is None:
+            return None   # corrupted or missing — _build_sample will skip
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
-        cap.release()
         return frame if ret else None
 
     def _build_sample(self, seq: dict) -> TrackingPair | None:
         """Build one (template, search) pair from a sequence."""
-        n = seq["n_frames"]
-        ann = self._annotations[seq["seq_name"]]
+        n       = seq["n_frames"]
+        ann     = self._annotations[seq["seq_name"]]
         ann_len = len(ann)
 
-        # ── choose template frame ──────────────────────────────────────────
         t_idx = random.randint(0, max(0, min(n - 2, ann_len - 2)))
-        s_idx = min(t_idx + random.randint(1, self.max_gap), n - 1,
-                    ann_len - 1)
+        s_idx = min(t_idx + random.randint(1, self.max_gap), n - 1, ann_len - 1)
 
         t_box = self._get_annotation_for_frame(seq, t_idx)
         s_box = self._get_annotation_for_frame(seq, s_idx)
 
-        # Skip degenerate boxes
         if t_box[2] <= 0 or t_box[3] <= 0:
             return None
         if s_box[2] <= 0 or s_box[3] <= 0:
@@ -393,36 +457,38 @@ class TrainingDataset(Dataset):
             return None
 
         # ── crop ──────────────────────────────────────────────────────────
-        t_crop, _, _    = crop_and_resize(t_frame, t_box,
-                                          self.template_size,
-                                          context_factor=2.0)
+        t_crop, _, _ = crop_and_resize(
+            t_frame, t_box, self.template_size, context_factor=2.0
+        )
         s_crop, s_scale, (sx1, sy1) = crop_and_resize(
             s_frame, s_box, self.search_size, context_factor=4.0
         )
 
         # ── augment ───────────────────────────────────────────────────────
+        # FIX 1: separate template/search augment; capture flip flag
+        s_flipped = False
         if self.augment:
-            t_crop = augment_image(t_crop)
-            s_crop = augment_image(s_crop)
+            t_crop             = augment_template(t_crop)
+            s_crop, s_flipped  = augment_search(s_crop)
 
         # ── normalise gt bbox to search crop (cx,cy,w,h in [0,1]) ────────
-        # Search crop was centred on s_box centre; compute offset
         s_cx = s_box[0] + s_box[2] / 2
         s_cy = s_box[1] + s_box[3] / 2
 
-        # In crop coordinates
         cx_crop = (s_cx - sx1) * s_scale
         cy_crop = (s_cy - sy1) * s_scale
         w_crop  = s_box[2] * s_scale
         h_crop  = s_box[3] * s_scale
 
-        # Normalise to [0, 1]
         cx_n = cx_crop / self.search_size
         cy_n = cy_crop / self.search_size
         w_n  = w_crop  / self.search_size
         h_n  = h_crop  / self.search_size
 
-        # Clamp
+        # FIX 1: mirror cx when search was flipped
+        if s_flipped:
+            cx_n = 1.0 - cx_n
+
         cx_n = float(np.clip(cx_n, 0.0, 1.0))
         cy_n = float(np.clip(cy_n, 0.0, 1.0))
         w_n  = float(np.clip(w_n,  0.0, 1.0))
@@ -438,23 +504,11 @@ class TrainingDataset(Dataset):
             frame_idx = s_idx,
         )
 
-    # ── Dataset interface ─────────────────────────────────────────────────────
-
     def __len__(self) -> int:
         return self.samples_per_epoch
 
     def __getitem__(self, _idx: int) -> dict:
-        """
-        Returns a dict (easier to collate with DataLoader):
-          {
-            'template':  Tensor (3, template_size, template_size),
-            'search':    Tensor (3, search_size,   search_size),
-            'gt_box':    Tensor (4,)   [cx, cy, w, h] normalised,
-            'seq_id':    str,
-            'frame_idx': int,
-          }
-        """
-        for _ in range(10):   # retry up to 10× on bad samples
+        for _ in range(10):
             seq    = random.choice(self.sequences)
             sample = self._build_sample(seq)
             if sample is not None:
@@ -465,7 +519,7 @@ class TrainingDataset(Dataset):
                     "seq_id":    sample.seq_id,
                     "frame_idx": sample.frame_idx,
                 }
-        # Fallback: return zeros (very rare)
+        # Fallback (very rare — only if 10 consecutive videos are corrupted)
         return {
             "template":  torch.zeros(3, self.template_size, self.template_size),
             "search":    torch.zeros(3, self.search_size,   self.search_size),
@@ -476,7 +530,7 @@ class TrainingDataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4.  prepare_data.py  helper  –  quick sanity-check / dataset stats
+# 4.  Dataset stats helper
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_dataset_stats(manifest_path: str, data_root: str):
@@ -493,14 +547,17 @@ def print_dataset_stats(manifest_path: str, data_root: str):
               f"{min(frames):>6} {max(frames):>6} "
               f"{sum(frames)//len(frames):>6}")
 
-    # Check how many videos actually exist
     print("\n── File existence check ──")
     for split, seqs in manifest.items():
         missing = 0
         for seq in seqs.values():
             vp = os.path.join(data_root, seq["video_path"])
-            ap = os.path.join(data_root, seq["annotation_path"])
-            if not os.path.exists(vp) or not os.path.exists(ap):
+            # FIX 5: guard against None annotation_path
+            ann_rel = seq.get("annotation_path")
+            ap = os.path.join(data_root, ann_rel) if ann_rel else None
+            vp_ok = os.path.exists(vp)
+            ap_ok = (ap is None) or os.path.exists(ap)
+            if not vp_ok or not ap_ok:
                 missing += 1
         status = "✓ all present" if missing == 0 else f"✗ {missing} missing"
         print(f"  {split}: {status}")
@@ -515,9 +572,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    
+
     parser.add_argument("--manifest",
-        default=os.path.join(_ROOT, "data", "contest_release", "metadata", "contestant_manifest.json"))
+        default=os.path.join(_ROOT, "data", "contest_release", "metadata",
+                             "contestant_manifest.json"))
     parser.add_argument("--data_root",
         default=os.path.join(_ROOT, "data", "contest_release"))
     parser.add_argument("--mode", choices=["stats", "sample"], default="stats")
