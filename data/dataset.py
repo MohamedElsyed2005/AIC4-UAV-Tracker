@@ -207,6 +207,8 @@ class _VideoCache:
         Returns (cap, decoded_frame_count) or None if the video is corrupt.
         Caches the handle on first access.
         """
+        path = os.path.normpath(path)
+        
         if path in self._caps:
             return self._caps[path], self._counts[path]
 
@@ -486,17 +488,36 @@ class TrainingDataset(Dataset):
       2 seconds apart when a 30-fps sequence samples 1/3 second apart.
     • _VideoCache maxsize=64 (covers full dataset, no eviction churn).
 
+    Train / val splitting
+    ─────────────────────
+    The 'public_lb' split contains only first-frame annotations and must NOT
+    be used for validation.  Instead, call the class-method split_train_val()
+    to obtain two TrainingDataset objects whose sequence lists are disjoint
+    subsets of the 'train' split:
+
+        train_ds, val_ds = TrainingDataset.split_train_val(
+            manifest_path, data_root,
+            val_ratio=0.15,          # 15 % of train sequences → val
+            train_samples=4000,
+            val_samples=500,
+        )
+
+    The 'public_lb' split is reserved exclusively for submission inference
+    via InferenceSequence (see submit.py).
+
     Args
     ────
     manifest_path      path to contestant_manifest.json
     data_root          root folder where dataset1/, dataset2/, … live
-    split              'train' or 'public_lb'
+    split              manifest split key to load sequences from ('train')
     template_size      output size for template crop (default 128)
     search_size        output size for search crop   (default 256)
     max_gap_frames     max frame gap at 30 fps (scaled to native fps per seq)
-    samples_per_epoch  virtual epoch length (default 50 000)
+    samples_per_epoch  virtual epoch length
     augment            apply image augmentations (default True)
     corrupt_log_path   path to write corrupted-sequence log (optional)
+    _sequences         (internal) pass a pre-built list of SeqMeta objects
+                       directly; manifest loading is skipped when set.
     """
 
     def __init__(
@@ -510,6 +531,7 @@ class TrainingDataset(Dataset):
         samples_per_epoch: int  = 50_000,
         augment:          bool  = True,
         corrupt_log_path: Optional[str] = None,
+        _sequences:       Optional[List["SeqMeta"]] = None,
     ):
         self.data_root          = data_root
         self.template_size      = template_size
@@ -517,6 +539,19 @@ class TrainingDataset(Dataset):
         self.max_gap_frames     = max_gap_frames
         self.samples_per_epoch  = samples_per_epoch
         self.augment            = augment
+
+        if _sequences is not None:
+            # ── Fast path: sequences already validated and split externally ──
+            # Used by split_train_val() to avoid double-validation.
+            self.sequences = _sequences
+            if not self.sequences:
+                raise RuntimeError("_sequences list is empty.")
+            print(
+                f"[TrainingDataset] (pre-split) | "
+                f"{len(self.sequences)} sequences | "
+                f"{samples_per_epoch} samples/epoch"
+            )
+            return
 
         # ── Load manifest ─────────────────────────────────────────────────
         with open(manifest_path, "r") as f:
@@ -528,13 +563,22 @@ class TrainingDataset(Dataset):
                 f"Available: {list(manifest.keys())}"
             )
 
+        if split == "public_lb":
+            raise ValueError(
+                "The 'public_lb' split must NOT be used for training or "
+                "validation — it only has first-frame annotations. "
+                "Use TrainingDataset.split_train_val() to get a held-out "
+                "validation subset from the 'train' split, and use "
+                "InferenceSequence (submit.py) for public_lb inference."
+            )
+
         raw_seqs = manifest[split]
 
         # ── Build SeqMeta objects ─────────────────────────────────────────
         seqs: List[SeqMeta] = []
         for seq_dict in raw_seqs.values():
             ann_rel  = seq_dict.get("annotation_path")
-            ann_path = os.path.join(data_root, ann_rel) if ann_rel else None
+            ann_path = os.path.normpath(os.path.join(data_root, ann_rel)) if ann_rel else None
             annotation: List[List[float]] = []
             if ann_path and os.path.exists(ann_path):
                 annotation = load_annotation(ann_path)
@@ -544,8 +588,8 @@ class TrainingDataset(Dataset):
                 seq_name        = seq_dict["seq_name"],
                 n_frames        = seq_dict["n_frames"],
                 native_fps      = float(seq_dict.get("native_fps", 30)),
-                video_path      = os.path.join(data_root, seq_dict["video_path"]),
-                annotation_path = ann_path,
+                video_path      = os.path.normpath(os.path.join(data_root, seq_dict["video_path"])),
+                annotation_path = os.path.normpath(ann_path) if ann_path else None,
                 annotation      = annotation,
             ))
 
@@ -566,8 +610,137 @@ class TrainingDataset(Dataset):
             f"{samples_per_epoch} samples/epoch"
         )
 
-        # ── Per-worker VideoCapture cache (created lazily in workers) ─────
-        self._vcache = _VideoCache(maxsize=64)
+    # ── Train / Val splitter ──────────────────────────────────────────────
+
+    @classmethod
+    def split_train_val(
+        cls,
+        manifest_path:    str,
+        data_root:        str,
+        val_ratio:        float = 0.15,
+        train_samples:    int   = 50_000,
+        val_samples:      int   = 2_000,
+        template_size:    int   = 128,
+        search_size:      int   = 256,
+        max_gap_frames:   int   = 100,
+        seed:             int   = 42,
+        corrupt_log_path: Optional[str] = None,
+    ) -> "Tuple[TrainingDataset, TrainingDataset]":
+        """
+        Build a train dataset and a held-out val dataset from the 'train'
+        manifest split.
+
+        Sequences are shuffled deterministically (seed) and split by
+        val_ratio at the *sequence* level — no frame from a val sequence
+        ever appears in the train loader, and vice versa.
+
+        The 'public_lb' split is intentionally excluded: it only contains
+        first-frame annotations and is reserved for submission inference.
+
+        Args
+        ────
+        manifest_path   path to contestant_manifest.json
+        data_root       dataset root directory
+        val_ratio       fraction of train sequences held out for val (0–1)
+        train_samples   virtual samples per epoch for the train dataset
+        val_samples     virtual samples per epoch for the val dataset
+        template_size   crop size for template images
+        search_size     crop size for search images
+        max_gap_frames  max frame gap at 30 fps
+        seed            RNG seed for reproducible sequence shuffle
+        corrupt_log_path  path for corrupted-sequence log file (optional)
+
+        Returns
+        ───────
+        (train_dataset, val_dataset)  — both are TrainingDataset instances
+        """
+        # ── Load + validate ALL train sequences once ─────────────────────
+        # We validate up-front so both subsets share the same clean list.
+        with open(manifest_path, "r") as f:
+            manifest = json.load(f)
+
+        if "train" not in manifest:
+            raise ValueError("'train' key not found in manifest.")
+
+        raw_seqs = manifest["train"]
+        seqs: List[SeqMeta] = []
+        for seq_dict in raw_seqs.values():
+            ann_rel  = seq_dict.get("annotation_path")
+            ann_path = os.path.normpath(os.path.join(data_root, ann_rel)) if ann_rel else None
+            annotation: List[List[float]] = []
+            if ann_path and os.path.exists(ann_path):
+                annotation = load_annotation(ann_path)
+
+            seqs.append(SeqMeta(
+                dataset         = seq_dict["dataset"],
+                seq_name        = seq_dict["seq_name"],
+                n_frames        = seq_dict["n_frames"],
+                native_fps      = float(seq_dict.get("native_fps", 30)),
+                video_path      = os.path.normpath(os.path.join(data_root, seq_dict["video_path"])),
+                annotation_path = os.path.normpath(ann_path) if ann_path else None,
+                annotation      = annotation,
+            ))
+
+        valid_seqs, _ = validate_sequences(seqs, log_path=corrupt_log_path)
+
+        if not valid_seqs:
+            raise RuntimeError(
+                "No valid train sequences found. "
+                "Check data_root and manifest paths."
+            )
+
+        # ── Shuffle + split ───────────────────────────────────────────────
+        rng = random.Random(seed)
+        shuffled = valid_seqs.copy()
+        rng.shuffle(shuffled)
+
+        n_val   = max(1, int(len(shuffled) * val_ratio))
+        n_train = len(shuffled) - n_val
+
+        train_seqs = shuffled[:n_train]
+        val_seqs   = shuffled[n_train:]
+
+        print(
+            f"[split_train_val] {len(valid_seqs)} valid sequences split into "
+            f"{len(train_seqs)} train / {len(val_seqs)} val  "
+            f"(val_ratio={val_ratio:.0%}, seed={seed})"
+        )
+
+        # ── Build dataset objects using the _sequences fast path ──────────
+        common_kwargs = dict(
+            manifest_path  = manifest_path,
+            data_root      = data_root,
+            template_size  = template_size,
+            search_size    = search_size,
+            max_gap_frames = max_gap_frames,
+        )
+
+        train_ds = cls(
+            **common_kwargs,
+            samples_per_epoch = train_samples,
+            augment           = True,
+            _sequences        = train_seqs,
+        )
+        val_ds = cls(
+            **common_kwargs,
+            samples_per_epoch = val_samples,
+            augment           = False,
+            _sequences        = val_seqs,
+        )
+
+        return train_ds, val_ds
+    
+    # ── Per-worker VideoCapture cache (created lazily in workers) ─────
+    # ── Lazy VideoCache (per-process safe) ─────────────────────────────
+    @property
+    def vcache(self):
+        """
+        Lazy-initialised per-process VideoCache.
+        Fixes Windows spawn + avoids sharing stale handles.
+        """
+        if not hasattr(self, "_vcache") or self._vcache is None:
+            self._vcache = _VideoCache(maxsize=64)
+        return self._vcache
 
     # ── Sampling helpers ──────────────────────────────────────────────────
 
@@ -608,7 +781,7 @@ class TrainingDataset(Dataset):
           The _VideoCache keeps the handle open for the worker's lifetime,
           reducing moov overhead to exactly one parse per sequence per worker.
         """
-        result = self._vcache.get(seq.video_path)
+        result = self.vcache.get(seq.video_path)
         if result is None:
             return None
         cap, decoded_count = result

@@ -1,8 +1,24 @@
 """
-train_hit.py  –  HiT Tracker Training Loop  (v2)
+train_hit.py  -  HiT Tracker Training Loop  (v3)
 =================================================
+Changes vs v2
+-------------
+7. Train-split validation (IMPORTANT DATA PIPELINE FIX):
+   The 'public_lb' split only contains first-frame annotations and must NOT
+   be used for validation.  Validation now uses a held-out subset of the
+   'train' split, created by TrainingDataset.split_train_val().
+
+   --val_ratio 0.15  (default)  splits 15% of train sequences into val.
+   Sequences are shuffled deterministically with --seed before splitting,
+   so the split is reproducible across runs.
+
+   Data flow summary:
+     train split (85%)  ->  training loader  (augmented, gradient updates)
+     train split (15%)  ->  val loader       (no augment, loss monitoring)
+     public_lb split    ->  submit.py ONLY   (inference, no annotations used)
+
 Changes vs v1
-─────────────
+-------------
 1. Pretrained backbone support:
    --pretrained_backbone  none | imagenet | timm
    With 'imagenet': loads weights from a MobileViT-XS checkpoint bundled via
@@ -12,7 +28,7 @@ Changes vs v1
 
 2. Gradient accumulation:
    --grad_accum N  accumulates gradients over N micro-batches before stepping.
-   Effective batch size = batch_size × grad_accum.
+   Effective batch size = batch_size x grad_accum.
    Useful on T4 when batch_size must be small due to VRAM.
 
 3. Corrupt-sequence log:
@@ -29,24 +45,26 @@ Changes vs v1
 
 6. Checkpoint includes param count and git hash (if available).
 
-Usage — T4 Colab (recommended):
-    python tools/train_hit.py \\
-        --manifest data/contest_release/metadata/contestant_manifest.json \\
-        --data_root data/contest_release \\
-        --output_dir /content/drive/MyDrive/hit_run1 \\
-        --epochs 50 \\
-        --batch_size 16 \\
-        --grad_accum 2 \\
-        --num_workers 2 \\
-        --lr 2e-4 \\
+Usage - T4 Colab (recommended):
+    python tools/train_hit.py \
+        --manifest data/contest_release/metadata/contestant_manifest.json \
+        --data_root data/contest_release \
+        --output_dir /content/drive/MyDrive/hit_run1 \
+        --epochs 50 \
+        --batch_size 16 \
+        --grad_accum 2 \
+        --num_workers 2 \
+        --lr 2e-4 \
+        --val_ratio 0.15 \
         --pretrained_backbone imagenet
 
-    Effective batch = 16 × 2 = 32, identical to v1 but uses half the VRAM
-    per step so larger search crops (320×320) become feasible.
+    Effective batch = 16 x 2 = 32, identical to v1 but uses half the VRAM
+    per step so larger search crops (320x320) become feasible.
 
 Resume:
     python tools/train_hit.py --resume /content/drive/MyDrive/hit_run1/latest.pth
 """
+
 
 import argparse
 import logging
@@ -86,6 +104,63 @@ sys.path.insert(0, str(_ROOT))
 
 from data.dataset     import TrainingDataset
 from models.hit.model import build_hit_tracker, HiTConfig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Manifest patching  (original file is NEVER modified)
+# ─────────────────────────────────────────────────────────────────────────────
+
+import json
+import tempfile
+
+def _patched_manifest(manifest_path: str, data_root: str, logger) -> str:
+    """
+    Read the manifest, probe every video file with cv2.VideoCapture,
+    remove any sequence whose video cannot be opened, and write a
+    sanitised copy to a NamedTemporaryFile.
+
+    Returns the path of the temp file.  The original manifest is untouched.
+    """
+    import cv2
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    removed = []
+    for split_name, sequences in manifest.items():
+        bad_keys = []
+        for seq_key, meta in sequences.items():
+            vid_rel = meta.get("video_path", "")
+            vid_abs = os.path.join(data_root, vid_rel)
+            cap = cv2.VideoCapture(vid_abs)
+            ok  = cap.isOpened()
+            cap.release()
+            if not ok:
+                bad_keys.append(seq_key)
+                logger.warning(
+                    "[manifest-patch] Removing unreadable sequence %s/%s → %s",
+                    split_name, seq_key, vid_abs,
+                )
+        for k in bad_keys:
+            del sequences[k]
+            removed.append(f"{split_name}/{k}")
+
+    if removed:
+        logger.info(
+            "[manifest-patch] Removed %d unreadable sequence(s): %s",
+            len(removed), ", ".join(removed),
+        )
+    else:
+        logger.info("[manifest-patch] All sequences readable — no entries removed.")
+
+    # Write sanitised manifest to a temp file (auto-cleaned on process exit)
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, encoding="utf-8"
+    )
+    json.dump(manifest, tmp, indent=2)
+    tmp.flush()
+    tmp.close()
+    return tmp.name
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -186,15 +261,17 @@ def parse_args():
     p.add_argument("--resume", default=None)
 
     # Training
-    p.add_argument("--epochs",            type=int,   default=50)
+    p.add_argument("--epochs",            type=int,   default=30)
     # T4 VRAM budget: 16 × (128²+256²) × fp16 ≈ 10 GB — leaves 6 GB for model
-    p.add_argument("--batch_size",        type=int,   default=16)
+    p.add_argument("--batch_size",        type=int,   default=2)
     # Effective batch = batch_size × grad_accum (default 16×2=32)
-    p.add_argument("--grad_accum",        type=int,   default=2)
+    p.add_argument("--grad_accum",        type=int,   default=4)
     # Colab: 2 physical CPU cores — more workers starve each other
     p.add_argument("--num_workers",       type=int,   default=2)
     p.add_argument("--samples_per_epoch", type=int,   default=4000)
     p.add_argument("--val_samples",       type=int,   default=500)
+    p.add_argument("--val_ratio",         type=float, default=0.15,
+        help="Fraction of train sequences held out for validation (default 0.15 = 15%%)")
 
     # Optimiser
     p.add_argument("--lr",              type=float, default=2e-4)
@@ -215,6 +292,9 @@ def parse_args():
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--log_interval",  type=int, default=20)
     p.add_argument("--val_interval",  type=int, default=1)
+    # Save a numbered checkpoint every N epochs regardless of val outcome.
+    # Protects against crashes when val is broken and best.pth never saves.
+    p.add_argument("--ckpt_every",    type=int, default=5)
 
     return p.parse_args()
 
@@ -232,10 +312,15 @@ def setup_logger(output_dir: str) -> logging.Logger:
     fmt = logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S")
 
     if not logger.handlers:
-        ch = logging.StreamHandler(sys.stdout)
+        # Use utf-8 writer on stdout to avoid UnicodeEncodeError on Windows (cp1252)
+        import io
+        utf8_stdout = io.TextIOWrapper(
+            sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+        ) if hasattr(sys.stdout, "buffer") else sys.stdout
+        ch = logging.StreamHandler(utf8_stdout)
         ch.setFormatter(fmt)
         logger.addHandler(ch)
-        fh = logging.FileHandler(log_path)
+        fh = logging.FileHandler(log_path, encoding="utf-8")
         fh.setFormatter(fmt)
         logger.addHandler(fh)
 
@@ -347,9 +432,11 @@ def validate(model, loader, device):
     model.eval()
     totals = {"loss": 0.0, "cls": 0.0, "giou": 0.0, "l1": 0.0}
     n = 0
+    n_skipped = 0
 
     for batch in loader:
         if batch is None:
+            n_skipped += 1
             continue
         template = batch["template"].to(device, non_blocking=True)
         search   = batch["search"].to(device, non_blocking=True)
@@ -365,8 +452,16 @@ def validate(model, loader, device):
         totals["l1"]   += losses["loss_l1"].item()
         n += 1
 
-    n = max(n, 1)
-    return {k: v / n for k, v in totals.items()}
+    if n == 0:
+        # All val batches were None (fallback zero-tensors filtered by safe_collate).
+        # This means the validation split videos are all unreadable / missing.
+        # Return NaN so the training loop can detect and log this properly
+        # instead of silently reporting 0.0 and saving a fake "best" checkpoint.
+        nan = float("nan")
+        return {"loss": nan, "cls": nan, "giou": nan, "l1": nan,
+                "n_batches": 0, "n_skipped": n_skipped}
+
+    return {k: v / n for k, v in totals.items()} | {"n_batches": n, "n_skipped": n_skipped}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -415,27 +510,32 @@ def main():
     logger.info("Device: %s", device)
     if device.type == "cuda":
         logger.info("  GPU: %s", torch.cuda.get_device_name(0))
+        logger.info("  VRAM: %.1f GB", torch.cuda.get_device_properties(0).total_memory / 1e9)
         torch.backends.cudnn.benchmark = True
+        # RTX 3050 is Ampere — TF32 gives ~2x matmul speed with negligible accuracy loss
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32       = True
 
     # ── Datasets ───────────────────────────────────────────────────────────
     corrupt_log = os.path.join(args.output_dir, "corrupted_sequences.txt")
     logger.info("Building datasets (startup validation runs now) …")
 
-    train_ds = TrainingDataset(
-        manifest_path     = args.manifest,
-        data_root         = args.data_root,
-        split             = "train",
-        samples_per_epoch = args.samples_per_epoch,
-        augment           = True,
-        corrupt_log_path  = corrupt_log,
-    )
-    val_ds = TrainingDataset(
-        manifest_path     = args.manifest,
-        data_root         = args.data_root,
-        split             = "public_lb",
-        samples_per_epoch = args.val_samples,
-        augment           = False,
-        corrupt_log_path  = corrupt_log,
+    # Patch the manifest in-memory: probe every video, strip unreadable ones.
+    # The original contestant_manifest.json on disk is NEVER modified.
+    clean_manifest = _patched_manifest(args.manifest, args.data_root, logger)
+
+    # Split train sequences into train/val subsets.
+    # public_lb has only first-frame annotations — it is reserved
+    # exclusively for submission inference (submit.py) and must NOT
+    # be used for validation here.
+    train_ds, val_ds = TrainingDataset.split_train_val(
+        manifest_path    = clean_manifest,
+        data_root        = args.data_root,
+        val_ratio        = args.val_ratio,
+        train_samples    = args.samples_per_epoch,
+        val_samples      = args.val_samples,
+        seed             = args.seed,
+        corrupt_log_path = corrupt_log,
     )
 
     # DataLoader notes for T4/Colab:
@@ -443,24 +543,38 @@ def main():
     # • prefetch_factor=2 overlaps CPU decoding with GPU compute.
     # • multiprocessing_context='fork' is fast on Linux (Colab default)
     #   but unsafe on macOS/Windows — fall back to default there.
-    _mp_ctx = "fork" if sys.platform.startswith("linux") else None
+    # Windows must use 'spawn' (fork is Unix-only).
+    # persistent_workers is unsafe with spawn — disable it on Windows.
+    if sys.platform.startswith("linux"):
+        _mp_ctx = "fork"
+    elif sys.platform == "win32":
+        _mp_ctx = "spawn"
+    else:
+        _mp_ctx = None
 
-    def _make_loader(ds, shuffle):
+    def _make_loader(ds, shuffle, is_val=False):
+        # Val runs with num_workers=0 (main process only).
+        # Reason: on Windows (spawn), each worker gets a fresh empty _vcache and
+        # must re-open every video.  With the lazy-cache fix this now works, but
+        # running val in-process is simpler, faster, and avoids any pickling edge
+        # cases with cv2.VideoCapture handles.
+        _workers = 0 if is_val else args.num_workers
+        _persistent = (_workers > 0) and (sys.platform != "win32")
         return DataLoader(
             ds,
             batch_size          = args.batch_size,
             shuffle             = shuffle,
-            num_workers         = args.num_workers,
+            num_workers         = _workers,
             pin_memory          = (device.type == "cuda"),
             drop_last           = shuffle,
-            persistent_workers  = (args.num_workers > 0),
-            prefetch_factor     = 2 if args.num_workers > 0 else None,
+            persistent_workers  = _persistent,
+            prefetch_factor     = 2 if _workers > 0 else None,
             collate_fn          = safe_collate,
-            multiprocessing_context = _mp_ctx if args.num_workers > 0 else None,
+            multiprocessing_context = _mp_ctx if _workers > 0 else None,
         )
 
-    train_loader = _make_loader(train_ds, shuffle=True)
-    val_loader   = _make_loader(val_ds,   shuffle=False)
+    train_loader = _make_loader(train_ds, shuffle=True,  is_val=False)
+    val_loader   = _make_loader(val_ds,   shuffle=False, is_val=True)
 
     logger.info(
         "  Train: %d samples  (%d batches × %d micro, accum=%d → eff_bs=%d)",
@@ -468,6 +582,33 @@ def main():
         args.grad_accum, args.batch_size * args.grad_accum,
     )
     logger.info("  Val:   %d samples  (%d batches)", len(val_ds), len(val_loader))
+
+    # ── Val smoke-test ────────────────────────────────────────────────────
+    # Val sequences are held-out subsets of the train split, so they are
+    # guaranteed to have full annotations and readable videos.
+    # We just confirm at least one opens cleanly.
+    import cv2 as _cv2
+    _val_ok = False
+    for _seq in val_ds.sequences[:3]:
+        _cap = _cv2.VideoCapture(os.path.normpath(_seq.video_path))
+        if _cap.isOpened():
+            _ret, _ = _cap.read()
+            _cap.release()
+            if _ret:
+                _val_ok = True
+                break
+        _cap.release()
+        logger.warning("  [val-probe] Cannot open val video: %s", _seq.video_path)
+    if _val_ok:
+        logger.info(
+            "  [val-probe] Val videos OK  (%d sequences from train split held out)",
+            len(val_ds.sequences),
+        )
+    else:
+        logger.error(
+            "  [val-probe] FAILED to open any val video. "
+            "This is unexpected since val sequences come from the train split."
+        )
 
     # ── Model ──────────────────────────────────────────────────────────────
     logger.info("Building model …")
@@ -561,32 +702,48 @@ def main():
 
         if (epoch + 1) % args.val_interval == 0:
             val_metrics = validate(model, val_loader, device)
-            logger.info(
-                "  [Val]    loss=%.4f  cls=%.4f  giou=%.4f  l1=%.4f",
-                val_metrics["loss"], val_metrics["cls"],
-                val_metrics["giou"], val_metrics["l1"],
-            )
+            n_val   = val_metrics.get("n_batches", -1)
+            n_skip  = val_metrics.get("n_skipped", -1)
 
-            if val_metrics["loss"] < best_val_loss:
-                best_val_loss = val_metrics["loss"]
-                best_path = os.path.join(args.output_dir, "best.pth")
-                save_checkpoint({
-                    "epoch":            epoch,
-                    "model_state":      model.state_dict(),
-                    "optimizer_state":  optimizer.state_dict(),
-                    "scheduler_state":  scheduler.state_dict(),
-                    "scaler_state":     scaler.state_dict(),
-                    "best_val_loss":    best_val_loss,
-                    "train_metrics":    train_metrics,
-                    "val_metrics":      val_metrics,
-                    "args":             vars(args),
-                    "git_hash":         _git_hash(),
-                    "params":           model.param_count(),
-                }, best_path)
-                logger.info(
-                    "  ✓ New best → %s  (val_loss=%.4f)",
-                    best_path, best_val_loss,
+            import math as _math
+            if n_val == 0 or _math.isnan(val_metrics["loss"]):
+                # This should be extremely rare — val sequences come from the
+                # train split and have been startup-validated.
+                logger.warning(
+                    "  [Val]    WARNING: all %d val batches were skipped "
+                    "(videos unreadable after startup validation). "
+                    "Skipping best-model save.",
+                    n_skip,
                 )
+            else:
+                logger.info(
+                    "  [Val]    loss=%.4f  cls=%.4f  giou=%.4f  l1=%.4f"
+                    "  (%d batches, %d skipped)",
+                    val_metrics["loss"], val_metrics["cls"],
+                    val_metrics["giou"], val_metrics["l1"],
+                    n_val, n_skip,
+                )
+
+                if val_metrics["loss"] < best_val_loss:
+                    best_val_loss = val_metrics["loss"]
+                    best_path = os.path.join(args.output_dir, "best.pth")
+                    save_checkpoint({
+                        "epoch":            epoch,
+                        "model_state":      model.state_dict(),
+                        "optimizer_state":  optimizer.state_dict(),
+                        "scheduler_state":  scheduler.state_dict(),
+                        "scaler_state":     scaler.state_dict(),
+                        "best_val_loss":    best_val_loss,
+                        "train_metrics":    train_metrics,
+                        "val_metrics":      val_metrics,
+                        "args":             vars(args),
+                        "git_hash":         _git_hash(),
+                        "params":           model.param_count(),
+                    }, best_path)
+                    logger.info(
+                        "  [Best]   New best checkpoint -> %s  (val_loss=%.4f)",
+                        best_path, best_val_loss,
+                    )
 
         latest_path = os.path.join(args.output_dir, "latest.pth")
         save_checkpoint({
@@ -598,6 +755,21 @@ def main():
             "best_val_loss":    best_val_loss,
             "args":             vars(args),
         }, latest_path)
+
+        # Periodic numbered checkpoint — saved unconditionally, independent of val.
+        if args.ckpt_every > 0 and (epoch + 1) % args.ckpt_every == 0:
+            epoch_path = os.path.join(args.output_dir, f"epoch_{epoch+1:03d}.pth")
+            save_checkpoint({
+                "epoch":           epoch,
+                "model_state":     model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "scaler_state":    scaler.state_dict(),
+                "best_val_loss":   best_val_loss,
+                "args":            vars(args),
+                "params":          model.param_count(),
+            }, epoch_path)
+            logger.info("  [Ckpt]   epoch checkpoint → %s", epoch_path)
 
     logger.info("\n" + "=" * 60)
     logger.info("Training complete.")

@@ -70,10 +70,6 @@ class HiTConfig:
     loss_w_giou: float = 2.0
     loss_w_l1:   float = 5.0
 
-    # Context factors for cropping
-    template_context: float = 2.0
-    search_context:   float = 4.0
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HiT Tracker Model  (v2)
