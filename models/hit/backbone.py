@@ -1,283 +1,277 @@
 """
-backbone.py  –  MobileViT-XS Backbone  (v2)
-============================================
-Changes vs v1
-─────────────
-1. pretrained(source, ckpt_path) class method:
-   Builds the backbone and optionally loads pretrained weights.
-   source = 'timm'     → load from timm mobilevit_xs
-   source = 'local'    → load from a local .pth checkpoint
-   source = None/'none' → random init (original behaviour)
+backbone.py  -  AlexNet Backbone for HiT Tracker
+==================================================
+Replaces MobileViT with a lightweight AlexNet-based feature extractor.
 
-2. freeze_backbone() / unfreeze_backbone():
-   Call freeze_backbone() at the start of training when using pretrained
-   weights.  Unfreeze after a few warmup epochs so the backbone adapts.
-   This is handled automatically by HiTTracker if --pretrained_backbone is set.
+Why AlexNet?
+  - Much lighter than MobileViT (~1.9M params vs 5M+ for MobileViT)
+  - Fast inference (pure conv, no attention overhead)
+  - Pretrained ImageNet weights available via torchvision
+  - No timm dependency (simpler deployment)
 
-3. No architectural changes — the MobileViT-XS structure is identical
-   to v1, ensuring full compatibility with the transformer head.
+Architecture:
+  Input: (B, 3, H, W)
+  AlexNet features[:8]           -> non-power-of-2 spatial size (15x15 / 7x7)
+  AdaptiveAvgPool2d(target_hw)   -> exact target size (16x16 / 8x8)  [FIX]
+  extra_conv (3x3, stride=1)     -> channel reduction, same spatial size
+  adapter    (1x1)               -> 96 channels
+  Output: (B, 96, target_hw, target_hw)
+
+WHY AdaptiveAvgPool2d IS NEEDED -- AlexNet MaxPool arithmetic:
+  AlexNet uses MaxPool2d(kernel=3, stride=2, padding=0).
+  With floor division, 256x256 input gives:
+    Conv(11,s=4,p=2): 63  ->  MaxPool(3,s=2): 31  ->  MaxPool(3,s=2): 15
+  And 128x128 gives:
+    Conv(11,s=4,p=2): 31  ->  MaxPool(3,s=2): 15  ->  MaxPool(3,s=2): 7
+  These are 15x15 and 7x7, NOT 16x16 and 8x8.
+  The assertion s_feat.shape == (B,96,16,16) therefore fires.
+
+  Fix: insert F.adaptive_avg_pool2d(x, target_hw) immediately after
+  features[:8] to normalize the spatial size to the configured target.
+  This is a standard, stable PyTorch operation with no learned parameters.
+
+Output:
+  - Channels: 96
+  - Spatial: template_hw x template_hw  for template inputs (default 8)
+             search_hw   x search_hw    for search inputs   (default 16)
+  - Compatible with CrossAttentionTransformer (in_channels=96)
+  - Ns = search_hw^2 = 256  (perfect square, required by TrackingHead)
 """
 
 import torch
-import timm
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision import models
 from typing import Optional
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Basic building blocks
-# ─────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
+# AlexNet Backbone
+# -------------------------------------------------------------------------
 
-class ConvBNAct(nn.Module):
-    """Conv → BN → Activation (standard mobile block)."""
-    def __init__(self, in_ch, out_ch, kernel=3, stride=1,
-                 padding=1, groups=1, act=True):
-        super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, kernel, stride,
-                              padding, groups=groups, bias=False)
-        self.bn   = nn.BatchNorm2d(out_ch)
-        self.act  = nn.SiLU() if act else nn.Identity()
-
-    def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
-
-
-class InvertedResidual(nn.Module):
-    """MobileNetV2-style Inverted Residual: expand → depthwise → project."""
-    def __init__(self, in_ch, out_ch, stride=1, expand_ratio=4):
-        super().__init__()
-        mid_ch = int(in_ch * expand_ratio)
-        self.use_res = (stride == 1 and in_ch == out_ch)
-        layers = []
-        if expand_ratio != 1:
-            layers.append(ConvBNAct(in_ch, mid_ch, kernel=1, padding=0))
-        layers += [
-            ConvBNAct(mid_ch, mid_ch, stride=stride, groups=mid_ch),
-            ConvBNAct(mid_ch, out_ch, kernel=1, padding=0, act=False),
-        ]
-        self.block = nn.Sequential(*layers)
-
-    def forward(self, x):
-        out = self.block(x)
-        return out + x if self.use_res else out
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MobileViT block
-# ─────────────────────────────────────────────────────────────────────────────
-
-class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, dim, heads=1, dropout=0.0):
-        super().__init__()
-        self.heads   = heads
-        self.scale   = (dim // heads) ** -0.5
-        self.qkv     = nn.Linear(dim, dim * 3, bias=False)
-        self.proj    = nn.Linear(dim, dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        h = self.heads
-        qkv = self.qkv(x).reshape(B, N, 3, h, C // h).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-        attn = self.dropout((q @ k.transpose(-2, -1)) * self.scale).softmax(dim=-1)
-        return self.proj((attn @ v).transpose(1, 2).reshape(B, N, C))
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, dim, heads=1, mlp_ratio=2, dropout=0.0):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn  = MultiHeadSelfAttention(dim, heads, dropout)
-        self.norm2 = nn.LayerNorm(dim)
-        self.ffn   = nn.Sequential(
-            nn.Linear(dim, dim * mlp_ratio), nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim * mlp_ratio, dim), nn.Dropout(dropout),
-        )
-
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.ffn(self.norm2(x))
-        return x
-
-
-class MobileViTBlock(nn.Module):
-    """Local CNN + global transformer on patches."""
-    def __init__(self, in_ch, dim, patch_size=2, depth=2, heads=1):
-        super().__init__()
-        self.ph = self.pw = patch_size
-        self.local_rep = nn.Sequential(
-            ConvBNAct(in_ch, in_ch),
-            ConvBNAct(in_ch, dim, kernel=1, padding=0, act=False),
-        )
-        self.transformer = nn.Sequential(
-            *[TransformerBlock(dim, heads) for _ in range(depth)]
-        )
-        self.norm  = nn.LayerNorm(dim)
-        self.proj  = ConvBNAct(dim, in_ch, kernel=1, padding=0, act=False)
-        self.fusion = ConvBNAct(2 * in_ch, in_ch, kernel=1, padding=0)
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        ph, pw = self.ph, self.pw
-        pad_h = (ph - H % ph) % ph
-        pad_w = (pw - W % pw) % pw
-        if pad_h or pad_w:
-            x = F.pad(x, (0, pad_w, 0, pad_h))
-        _, _, Hp, Wp = x.shape
-        nph, npw = Hp // ph, Wp // pw
-        num_patches = nph * npw
-
-        y = self.local_rep(x)
-        dim = y.shape[1]
-        y = y.reshape(B, dim, nph, ph, npw, pw)
-        y = y.permute(0, 2, 4, 3, 5, 1).reshape(B * num_patches, ph * pw, dim)
-        y = self.norm(self.transformer(y))
-        y = y.reshape(B, nph, npw, ph, pw, dim)
-        y = y.permute(0, 5, 1, 3, 2, 4).reshape(B, dim, Hp, Wp)
-        y = self.proj(y)
-        if pad_h or pad_w:
-            y = y[:, :, :H, :W]
-            x = x[:, :, :H, :W]
-        return self.fusion(torch.cat([x, y], dim=1))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MobileViT-XS Backbone (v2: + pretrained loading)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class MobileViTBackbone(nn.Module):
+class AlexNetBackbone(nn.Module):
     """
-    MobileViT-XS Backbone using timm pretrained weights (ImageNet).
+    Lightweight AlexNet-based feature extractor with adaptive spatial pooling.
 
-    This replaces the custom implementation to ensure 100% compatibility
-    with pretrained weights from timm.
+    The backbone uses AlexNet features[:8] (stride ~16, 384 channels) followed
+    by AdaptiveAvgPool2d to normalize the spatial size to the configured target,
+    a 3x3 channel-reduction conv, and a 1x1 projection to 96 channels.
 
-    Output:
-        - Channels: 96
-        - Stride: 16
+    KEY FIX:
+      AlexNet MaxPool layers use floor division so 256x256->15x15 and
+      128x128->7x7 (not the expected 16x16 and 8x8).  A previous attempt to
+      fix this by setting extra_conv stride=1 was correct in principle but
+      still produced 15/7 instead of 16/8.  This version inserts
+      F.adaptive_avg_pool2d(x, target_hw) after features[:8] to force the
+      correct output size regardless of the exact MaxPool arithmetic.
+
+    Target size selection:
+      The backbone infers which target size to use from the input resolution:
+        input_hw <= 160  ->  template branch  ->  target = template_hw (8)
+        input_hw  > 160  ->  search  branch   ->  target = search_hw   (16)
+      This covers the standard 128/256 split.  Change template_hw/search_hw
+      in the constructor if you change input resolutions.
+
+    Total params: ~1.9M
+    Nominal stride: 16
+    Output channels: 96
+
+    Args:
+        pretrained:   load ImageNet weights for AlexNet layers (default True)
+        template_hw:  output spatial size for template inputs (default 8)
+        search_hw:    output spatial size for search inputs   (default 16)
     """
 
-    def __init__(self, in_ch=3):
+    def __init__(self,
+                 pretrained:  bool = True,
+                 template_hw: int  = 8,
+                 search_hw:   int  = 16):
         super().__init__()
 
-        # Load pretrained MobileViT-XS from timm
-        self.backbone = timm.create_model(
-            "mobilevit_xs",
-            pretrained=True,
-            features_only=True  # <-- IMPORTANT
+        self._template_hw = template_hw
+        self._search_hw   = search_hw
+
+        # Load AlexNet pretrained backbone
+        alexnet = models.alexnet(
+            weights=models.AlexNet_Weights.IMAGENET1K_V1 if pretrained else None
         )
 
-        # Get number of channels from last feature map
-        in_channels = self.backbone.feature_info[-2]["num_chs"]
+        # AlexNet features[:8] (indices 0-7):
+        #   [0] Conv2d(3,64, 11,stride=4,padding=2)   stride~4   64ch
+        #   [1] ReLU
+        #   [2] MaxPool2d(3, stride=2)                stride~8   64ch
+        #   [3] Conv2d(64,192, 5,padding=2)            stride~8  192ch
+        #   [4] ReLU
+        #   [5] MaxPool2d(3, stride=2)                stride~16 192ch
+        #   [6] Conv2d(192,384, 3,padding=1)           stride~16 384ch
+        #   [7] ReLU                                   OUTPUT 384ch
+        #
+        # Actual spatial output (floor-division MaxPool, no padding):
+        #   256x256 -> 15x15   (NOT 16x16 -- fixed by adaptive_avg_pool2d below)
+        #   128x128 -> 7x7     (NOT 8x8   -- fixed by adaptive_avg_pool2d below)
+        self.features = alexnet.features[:8]   # (B, 384, ~H/16, ~W/16)
 
-        # Adapter to match expected 96 channels
+        # Channel reduction conv, stride=1: spatial size stays at target_hw
+        # (adaptive pool above already set the exact size).
+        self.extra_conv = nn.Sequential(
+            nn.Conv2d(384, 256, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+
+        # Project to 96 channels (required by transformer)
         self.adapter = nn.Sequential(
-            nn.Conv2d(in_channels, 96, kernel_size=1, bias=False),
+            nn.Conv2d(256, 96, kernel_size=1, bias=False),
             nn.BatchNorm2d(96),
             nn.ReLU(inplace=True),
         )
 
-    def forward(self, x):
-        # Extract feature maps
-        features = self.backbone(x)
+        self._init_weights()
 
-        # Take last stage output
-        x = features[-2]   
-        
-        # Convert to 96 channels
-        x = self.adapter(x)
+    def _init_weights(self):
+        for m in [self.extra_conv, self.adapter]:
+            for layer in m.modules():
+                if isinstance(layer, nn.Conv2d):
+                    nn.init.kaiming_normal_(
+                        layer.weight, mode='fan_out', nonlinearity='relu')
+                elif isinstance(layer, nn.BatchNorm2d):
+                    nn.init.ones_(layer.weight)
+                    nn.init.zeros_(layer.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, 3, H, W) input image, ImageNet-normalized
+               H <= 160 -> template branch -> output (B, 96, template_hw, template_hw)
+               H  > 160 -> search  branch  -> output (B, 96, search_hw,   search_hw)
+
+        Returns:
+            feat: (B, 96, target_hw, target_hw)
+                  template 128x128 -> (B, 96, 8,  8)
+                  search   256x256 -> (B, 96, 16, 16)
+        """
+        in_hw     = x.shape[2]
+        target_hw = self._template_hw if in_hw <= 160 else self._search_hw
+
+        x = self.features(x)           # (B, 384, ~in_hw/16, ~in_hw/16)
+
+        # Normalize to exact target size.
+        # AlexNet MaxPool floor-division: 256->15 and 128->7 instead of 16, 8.
+        # adaptive_avg_pool2d corrects this without extra parameters.
+        if x.shape[2] != target_hw or x.shape[3] != target_hw:
+            x = F.adaptive_avg_pool2d(x, target_hw)
+
+        x = self.extra_conv(x)         # (B, 256, target_hw, target_hw)
+        x = self.adapter(x)            # (B, 96,  target_hw, target_hw)
         return x
-    
+
     def freeze(self):
-        """
-        Freeze all backbone parameters.
-        """
-        for param in self.parameters():
+        """Freeze AlexNet base features (keep extra_conv and adapter trainable)."""
+        for param in self.features.parameters():
             param.requires_grad = False
 
     def unfreeze(self):
-        """
-        Unfreeze all backbone parameters.
-        """
+        """Unfreeze all parameters."""
         for param in self.parameters():
             param.requires_grad = True
 
+    def freeze_all(self):
+        """Freeze everything including adapter."""
+        for param in self.parameters():
+            param.requires_grad = False
+
     @classmethod
-    def pretrained(cls, source: Optional[str] = "timm", ckpt_path: Optional[str] = None):
+    def pretrained(cls, source: Optional[str] = "imagenet",
+                   ckpt_path: Optional[str] = None) -> "AlexNetBackbone":
         """
         Factory method to build backbone with optional pretrained weights.
+
+        Args:
+            source:    'imagenet' | 'local' | 'none'
+            ckpt_path: path to local .pth checkpoint (required if source='local')
         """
-        model = cls()
-
         if source is None or source == "none":
-            return model
-
-        if source == "timm":
-            # already loaded by timm in __init__
-            return model
-
+            return cls(pretrained=False)
+        if source in ("imagenet", "timm"):
+            return cls(pretrained=True)
         if source == "local":
             if ckpt_path is None:
-                raise ValueError("ckpt_path must be provided for local pretrained")
-
-            ckpt = torch.load(ckpt_path, map_location="cpu")
+                raise ValueError("ckpt_path must be provided for source='local'")
+            model = cls(pretrained=False)
+            ckpt  = torch.load(ckpt_path, map_location="cpu")
             state = ckpt.get("model_state", ckpt.get("state_dict", ckpt))
             model.load_state_dict(state, strict=False)
             return model
-
-        raise ValueError(f"Unknown pretrained source: {source}")
+        raise ValueError(f"Unknown pretrained source: {source!r}")
 
     @property
-    def out_channels(self):
+    def out_channels(self) -> int:
         return 96
 
     @property
-    def stride(self):
+    def stride(self) -> int:
+        """Nominal stride (used by HiTConfig to compute feature map sizes)."""
         return 16
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Utilities
-# ─────────────────────────────────────────────────────────────────────────────
 
-def count_parameters(model):
+# -------------------------------------------------------------------------
+# Utilities
+# -------------------------------------------------------------------------
+
+# Keep backward-compatible alias
+MobileViTBackbone = AlexNetBackbone
+
+
+def count_parameters(model: nn.Module) -> int:
+    """Count total (not just trainable) parameters."""
+    return sum(p.numel() for p in model.parameters())
+
+
+def count_trainable_parameters(model: nn.Module) -> int:
+    """Count only trainable parameters."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
 # Sanity check
-# ─────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import time
 
-    bb = MobileViTBackbone()
+    bb = AlexNetBackbone(pretrained=False)
     bb.eval()
 
-    template = torch.randn(1, 3, 128, 128)
-    search   = torch.randn(1, 3, 256, 256)
+    template = torch.randn(2, 3, 128, 128)
+    search   = torch.randn(2, 3, 256, 256)
 
     with torch.no_grad():
-        t0 = time.time()
+        t0     = time.time()
         t_feat = bb(template)
         s_feat = bb(search)
         elapsed = (time.time() - t0) * 1000
 
     params = count_parameters(bb)
-    print("=" * 50)
-    print("MobileViT-XS Backbone v2 — Sanity Check")
-    print("=" * 50)
-    print(f"Template: {tuple(template.shape)} → {tuple(t_feat.shape)}")
-    print(f"Search:   {tuple(search.shape)} → {tuple(s_feat.shape)}")
+
+    print("=" * 60)
+    print("AlexNet Backbone -- Sanity Check (AdaptiveAvgPool2d fix)")
+    print("=" * 60)
+    print(f"Template: {tuple(template.shape)} -> {tuple(t_feat.shape)}")
+    print(f"Search:   {tuple(search.shape)} -> {tuple(s_feat.shape)}")
     print(f"Params:   {params:,}  ({params/1e6:.2f}M)")
     print(f"Time:     {elapsed:.1f} ms (CPU)")
-    print(f"Budget:   {'✓' if params < 10e6 else '✗'}  (<10M)")
-    print(f"Stride:   {bb.stride}  (expected 16)")
+    print(f"Budget:   {'OK' if params < 10e6 else 'OVER'}  (<10M)")
     print(f"Channels: {bb.out_channels}  (expected 96)")
 
-    # Test pretrained factory (prints warning if timm not installed)
-    bb2 = MobileViTBackbone.pretrained(source="timm")
-    print(f"\npretrained() factory OK — params: {count_parameters(bb2):,}")
-    print("=" * 50)
+    assert t_feat.shape == (2, 96, 8, 8),   f"FAIL template feat {t_feat.shape}"
+    assert s_feat.shape == (2, 96, 16, 16), f"FAIL search feat   {s_feat.shape}"
+    print("\nShape assertions: PASSED")
+
+    # Test freeze/unfreeze
+    bb.freeze()
+    frozen = count_trainable_parameters(bb)
+    bb.unfreeze()
+    all_p  = count_parameters(bb)
+    assert frozen < all_p, "Freeze did not reduce trainable count"
+    print(f"Freeze test: {frozen:,} trainable when frozen (full={all_p:,}): PASSED")
+    print("=" * 60)

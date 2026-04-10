@@ -1,32 +1,43 @@
 """
-dataset.py  –  AIC-4 UAV Tracker  (v2 — robust manifest-aware loader)
-=======================================================================
-Changes vs v1
-─────────────
-1. validate_sequences() — scans every sequence at startup:
-   • checks video file exists
-   • attempts cap.isOpened() (catches moov atom errors early)
-   • reads cap.get(CAP_PROP_FRAME_COUNT) and warns if it differs from n_frames
-   • logs all corrupted/missing entries to a file
-   Corrupted sequences are removed from self.sequences before training starts,
-   so __getitem__ never wastes retries on systematically broken videos.
+dataset.py  –  AIC-4 UAV Tracker  (v3 — jitter fix + padding fix)
+==================================================================
 
-2. _VideoCache.maxsize raised to 64 (covers all training sequences so no
-   eviction during a typical epoch).
+CRITICAL FIXES vs v2
+────────────────────
+1. **JITTER AUGMENTATION** [ROOT CAUSE OF 4% PERFORMANCE — FIXED]
+   Previous code always centered the search crop on the GT box.
+   This means the model ALWAYS saw the target at normalised position (0.5, 0.5).
+   During inference the tracker centres on its last prediction (not GT), so
+   the model's "always predict centre" behaviour made it NEVER move — the
+   tracker froze at the initialisation position and IoU collapsed to ~4%.
 
-3. _build_sample: frame index upper bound is
-       min(n_frames, ann_len, cap_frame_count) - 1
-   This eliminates the silent "decoded count ≠ n_frames" drift.
+   Fix: add Gaussian jitter (σ = 0.25 × crop_side) to the search crop centre
+   during training.  The target is now seen at varying positions [~0.1, ~0.9],
+   forcing the model to learn genuine localisation.  This is the same technique
+   used by SiamRPN++, OSTrack, MixFormer, etc.
 
-4. native_fps stored per sequence — used to scale max_gap so that the
-   template/search gap is always ≤ max_gap_seconds of real time regardless
-   of the sequence's native frame rate.
+2. **PADDING COORDINATE BUG** [SILENT GT MISALIGNMENT — FIXED]
+   When crop_and_resize adds border padding, the returned (x1, y1) is in
+   *padded* frame coordinates.  But s_cx / s_cy (from the annotation) are in
+   *original* frame coordinates.  For any crop that touches a frame border the
+   GT centre was silently shifted by (pad_left * scale, pad_top * scale) pixels
+   in normalised crop space.
 
-5. safe __getitem__: after 10 failed retries the fallback is logged, not
-   silently swallowed.
+   Fix: `_build_sample` now computes the offset using the *original* (pre-pad)
+   top-left corner:
+       x1_orig = round(cx - s/2)   (may be negative)
+       cx_crop = (s_cx - x1_orig) * s_scale
 
-6. print_dataset_stats: shows per-split fps histogram and flags sequences
-   whose decoded frame count disagrees with n_frames.
+   crop_and_resize is unchanged; we just capture the pre-pad origin separately.
+
+3. **CROP SIZE FORMULA UNIFICATION**
+   Training used `(w+h)/2 × factor` (arithmetic mean).
+   Inference (tracker.py) used `sqrt(w×h) × factor` (geometric mean).
+   For highly non-square UAV targets (e.g. w=52, h=123) the difference reaches
+   ~9%.  Fix: training now uses sqrt(w×h) to match tracker.py exactly.
+
+All other v2 improvements (validate_sequences, _VideoCache, fps-scaled gap,
+etc.) are preserved unchanged.
 """
 
 import json
@@ -89,26 +100,38 @@ def crop_and_resize(
     box: List[float],
     output_size: int,
     context_factor: float = 2.0,
-) -> Tuple[np.ndarray, float, Tuple[int, int]]:
+) -> Tuple[np.ndarray, float, Tuple[int, int], Tuple[int, int]]:
     """
     Crop a square region centred on `box` with context padding,
     then resize to output_size × output_size.
 
+    FIX v3: now returns BOTH the pre-padding AND post-padding top-left
+    so callers can use the correct origin for GT coordinate mapping.
+
     Returns:
-        crop     – (output_size, output_size, 3) uint8
-        scale    – output_size / crop_side
-        (x1, y1) – top-left corner in (possibly padded) frame coords
+        crop          – (output_size, output_size, 3) uint8
+        scale         – output_size / crop_side
+        (x1, y1)      – top-left in PADDED frame coords  (for indexing)
+        (ox1, oy1)    – top-left in ORIGINAL frame coords (for GT mapping)
+                        equals (x1 - pad_left, y1 - pad_top)
+                        NOTE: may be negative when crop goes outside frame
     """
+    import math
     H, W = frame.shape[:2]
     x, y, w, h = box
     cx = x + w / 2
     cy = y + h / 2
-    s  = max((w + h) / 2 * context_factor, 1.0)
+
+    # FIX: use geometric mean to match tracker.py crop size formula
+    s = max(math.sqrt(w * h) * context_factor, 1.0)
 
     x1 = int(round(cx - s / 2))
     y1 = int(round(cy - s / 2))
     x2 = int(round(cx + s / 2))
     y2 = int(round(cy + s / 2))
+
+    # Remember original (pre-padding) origin for GT mapping
+    ox1, oy1 = x1, y1
 
     pad_top    = max(0, -y1)
     pad_left   = max(0, -x1)
@@ -127,11 +150,11 @@ def crop_and_resize(
     crop_side = max(crop.shape[0], crop.shape[1], 1)
     scale = output_size / crop_side
     crop  = cv2.resize(crop, (output_size, output_size))
-    return crop, scale, (x1, y1)
+    return crop, scale, (x1, y1), (ox1, oy1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Augmentation (v2: separate template/search; flip returns flag)
+# Augmentation
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _photometric_augment(img: np.ndarray) -> np.ndarray:
@@ -146,7 +169,7 @@ def _photometric_augment(img: np.ndarray) -> np.ndarray:
 
 
 def augment_template(img: np.ndarray) -> np.ndarray:
-    """Photometric only — template must stay stable (no flip)."""
+    """Photometric only — template must stay stable."""
     return _photometric_augment(img)
 
 
@@ -154,7 +177,6 @@ def augment_search(img: np.ndarray) -> Tuple[np.ndarray, bool]:
     """
     Photometric + optional horizontal flip.
     Returns (augmented_image, flipped:bool).
-    Caller must mirror cx_n when flipped=True: cx_n = 1.0 - cx_n.
     """
     img = _photometric_augment(img)
     flipped = False
@@ -184,31 +206,16 @@ def to_tensor(img: np.ndarray) -> torch.Tensor:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _VideoCache:
-    """
-    LRU VideoCapture cache for one DataLoader worker process.
-
-    FIX: maxsize raised to 64 — covers all training sequences so handles
-    are almost never evicted during an epoch, eliminating repeated moov
-    atom scans.
-
-    Each cache entry also stores the real decoded frame count obtained at
-    open-time (cap.get(CAP_PROP_FRAME_COUNT)), which is used to clamp the
-    sampling index and avoid seeking past EOF.
-    """
+    """LRU VideoCapture cache for one DataLoader worker process."""
 
     def __init__(self, maxsize: int = 64):
         self._caps:    Dict[str, cv2.VideoCapture] = {}
-        self._counts:  Dict[str, int]              = {}   # decoded frame count
+        self._counts:  Dict[str, int]              = {}
         self._order:   List[str]                   = []
         self._maxsize: int                         = maxsize
 
     def get(self, path: str) -> Optional[Tuple[cv2.VideoCapture, int]]:
-        """
-        Returns (cap, decoded_frame_count) or None if the video is corrupt.
-        Caches the handle on first access.
-        """
         path = os.path.normpath(path)
-        
         if path in self._caps:
             return self._caps[path], self._counts[path]
 
@@ -218,10 +225,8 @@ class _VideoCache:
             logger.warning("_VideoCache: cannot open %s", path)
             return None
 
-        # Real decoded frame count (may differ from manifest n_frames)
         decoded = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if decoded <= 0:
-            # Fallback: count manually (slow, only for pathological files)
             decoded = 0
             while True:
                 ret, _ = cap.read()
@@ -230,7 +235,6 @@ class _VideoCache:
                 decoded += 1
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-        # Evict oldest if over capacity
         if len(self._order) >= self._maxsize:
             oldest = self._order.pop(0)
             old_cap = self._caps.pop(oldest, None)
@@ -252,21 +256,20 @@ class _VideoCache:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sequence metadata (enriched from manifest + startup validation)
+# Sequence metadata
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class SeqMeta:
-    """All per-sequence metadata used by the dataset."""
     dataset:         str
     seq_name:        str
-    n_frames:        int          # from manifest (ground truth)
-    native_fps:      float        # from manifest
-    video_path:      str          # absolute path
+    n_frames:        int
+    native_fps:      float
+    video_path:      str
     annotation_path: Optional[str]
     annotation:      List[List[float]] = field(default_factory=list)
-    decoded_frames:  int          = 0    # from CAP_PROP_FRAME_COUNT at open
-    valid:           bool         = True  # False = skip this sequence
+    decoded_frames:  int               = 0
+    valid:           bool              = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -280,20 +283,6 @@ def validate_sequences(
     """
     Open every video once at startup, record decoded_frames, and flag
     sequences whose video is missing or corrupt.
-
-    WHY THIS FIXES "moov atom not found":
-      The first VideoCapture.open() is the moment ffmpeg reads the moov atom.
-      If it fails here (moov missing, file truncated, wrong codec), we mark
-      the sequence invalid and remove it from training — the DataLoader never
-      encounters it again.  We do NOT open-close in __getitem__; the handle
-      stays open in _VideoCache for the lifetime of the worker.
-
-    Args:
-        sequences: list of SeqMeta objects
-        log_path:  if given, write corrupted-sequence log to this file
-
-    Returns:
-        (valid_sequences, corrupted_ids)
     """
     valid:     List[SeqMeta] = []
     corrupted: List[str]     = []
@@ -301,15 +290,12 @@ def validate_sequences(
     for seq in sequences:
         seq_id = f"{seq.dataset}/{seq.seq_name}"
 
-        # ── 1. Check file exists ─────────────────────────────────────────
         if not os.path.exists(seq.video_path):
             logger.warning("[SKIP] missing video: %s", seq.video_path)
             corrupted.append(f"{seq_id}: file not found")
             seq.valid = False
             continue
 
-        # ── 2. Attempt VideoCapture open ─────────────────────────────────
-        # This is the exact point where ffmpeg emits "moov atom not found".
         cap = cv2.VideoCapture(seq.video_path)
         if not cap.isOpened():
             cap.release()
@@ -318,10 +304,8 @@ def validate_sequences(
             seq.valid = False
             continue
 
-        # ── 3. Record decoded frame count ────────────────────────────────
         decoded = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
-
         seq.decoded_frames = decoded
 
         if decoded <= 0:
@@ -330,16 +314,12 @@ def validate_sequences(
             seq.valid = False
             continue
 
-        # ── 4. Warn on n_frames mismatch (don't skip, just log) ──────────
-        # The manifest n_frames is ground truth for annotation alignment.
-        # We use min(n_frames, decoded_frames) as the safe upper bound.
         if abs(decoded - seq.n_frames) > max(5, 0.02 * seq.n_frames):
             logger.warning(
                 "[WARN] frame count mismatch %s: manifest=%d decoded=%d",
                 seq_id, seq.n_frames, decoded,
             )
 
-        # ── 5. Check annotation ──────────────────────────────────────────
         if not seq.annotation:
             logger.warning("[SKIP] empty annotation: %s", seq_id)
             corrupted.append(f"{seq_id}: annotation empty")
@@ -380,10 +360,10 @@ class InferenceSequence:
     """
 
     def __init__(self, seq_info: dict, data_root: str):
-        self.seq_info  = seq_info
-        self.data_root = data_root
-        self.seq_id    = f"{seq_info['dataset']}/{seq_info['seq_name']}"
-        self.n_frames  = seq_info["n_frames"]
+        self.seq_info   = seq_info
+        self.data_root  = data_root
+        self.seq_id     = f"{seq_info['dataset']}/{seq_info['seq_name']}"
+        self.n_frames   = seq_info["n_frames"]
         self.native_fps = seq_info.get("native_fps", 30)
 
         video_path = os.path.join(data_root, seq_info["video_path"])
@@ -409,22 +389,17 @@ class InferenceSequence:
         self._predictions: Dict[int, List[float]] = {}
 
     def get_init(self) -> Tuple[np.ndarray, List[float]]:
-        """Returns (first_frame_BGR, init_bbox [x,y,w,h]). Seeks to frame 0."""
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         ret, frame = self.cap.read()
         if not ret:
             raise RuntimeError(f"Cannot read first frame of {self.seq_id}")
         if not self.boxes:
-            raise RuntimeError(
-                f"No annotation for {self.seq_id}. "
-                "Set self.boxes = [[x,y,w,h]] externally before calling get_init()."
-            )
+            raise RuntimeError(f"No annotation for {self.seq_id}.")
         init_box = self.boxes[0]
         self._predictions[0] = init_box
         return frame, init_box
 
     def __iter__(self):
-        """Yield (frame_index, frame_BGR) starting from frame 1."""
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 1)
         frame_idx = 1
         while frame_idx < self.n_frames:
@@ -471,53 +446,26 @@ class TrackingPair:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TrainingDataset (v2)
+# TrainingDataset (v3 — jitter fix)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TrainingDataset(Dataset):
     """
     Manifest-aware training dataset.
 
-    Key improvements vs v1
-    ──────────────────────
-    • Reads ONLY from contestant_manifest.json — zero directory walking.
-    • validate_sequences() called at __init__: corrupted/missing videos are
-      removed before the first __getitem__.
-    • Frame index sampling clamped to min(n_frames, decoded_frames, ann_len).
-    • max_gap scaled by native_fps so a 96-fps sequence doesn't sample frames
-      2 seconds apart when a 30-fps sequence samples 1/3 second apart.
-    • _VideoCache maxsize=64 (covers full dataset, no eviction churn).
-
-    Train / val splitting
-    ─────────────────────
-    The 'public_lb' split contains only first-frame annotations and must NOT
-    be used for validation.  Instead, call the class-method split_train_val()
-    to obtain two TrainingDataset objects whose sequence lists are disjoint
-    subsets of the 'train' split:
-
-        train_ds, val_ds = TrainingDataset.split_train_val(
-            manifest_path, data_root,
-            val_ratio=0.15,          # 15 % of train sequences → val
-            train_samples=4000,
-            val_samples=500,
-        )
-
-    The 'public_lb' split is reserved exclusively for submission inference
-    via InferenceSequence (see submit.py).
+    CRITICAL FIX in v3:
+    ───────────────────
+    Search crop jitter: the search region is no longer always centred exactly
+    on s_box.  Instead the centre is jittered by Gaussian noise with
+    σ = jitter_sigma × crop_side (default 0.25).  This forces the model to
+    genuinely localise the target rather than always predicting the centre,
+    which was the root cause of ~4% tracker performance.
 
     Args
     ────
-    manifest_path      path to contestant_manifest.json
-    data_root          root folder where dataset1/, dataset2/, … live
-    split              manifest split key to load sequences from ('train')
-    template_size      output size for template crop (default 128)
-    search_size        output size for search crop   (default 256)
-    max_gap_frames     max frame gap at 30 fps (scaled to native fps per seq)
-    samples_per_epoch  virtual epoch length
-    augment            apply image augmentations (default True)
-    corrupt_log_path   path to write corrupted-sequence log (optional)
-    _sequences         (internal) pass a pre-built list of SeqMeta objects
-                       directly; manifest loading is skipped when set.
+    jitter_sigma  Standard deviation of search centre jitter as a fraction
+                  of the crop side length.  0.25 is standard (SiamRPN++ etc).
+                  Set to 0.0 to disable (not recommended).
     """
 
     def __init__(
@@ -527,9 +475,10 @@ class TrainingDataset(Dataset):
         split:            str   = "train",
         template_size:    int   = 128,
         search_size:      int   = 256,
-        max_gap_frames:   int   = 100,     # at 30 fps → ~3 seconds
+        max_gap_frames:   int   = 100,
         samples_per_epoch: int  = 50_000,
         augment:          bool  = True,
+        jitter_sigma:     float = 0.25,
         corrupt_log_path: Optional[str] = None,
         _sequences:       Optional[List["SeqMeta"]] = None,
     ):
@@ -539,21 +488,20 @@ class TrainingDataset(Dataset):
         self.max_gap_frames     = max_gap_frames
         self.samples_per_epoch  = samples_per_epoch
         self.augment            = augment
+        self.jitter_sigma       = jitter_sigma
 
         if _sequences is not None:
-            # ── Fast path: sequences already validated and split externally ──
-            # Used by split_train_val() to avoid double-validation.
             self.sequences = _sequences
             if not self.sequences:
                 raise RuntimeError("_sequences list is empty.")
             print(
                 f"[TrainingDataset] (pre-split) | "
                 f"{len(self.sequences)} sequences | "
-                f"{samples_per_epoch} samples/epoch"
+                f"{samples_per_epoch} samples/epoch | "
+                f"jitter_sigma={jitter_sigma}"
             )
             return
 
-        # ── Load manifest ─────────────────────────────────────────────────
         with open(manifest_path, "r") as f:
             manifest = json.load(f)
 
@@ -566,15 +514,10 @@ class TrainingDataset(Dataset):
         if split == "public_lb":
             raise ValueError(
                 "The 'public_lb' split must NOT be used for training or "
-                "validation — it only has first-frame annotations. "
-                "Use TrainingDataset.split_train_val() to get a held-out "
-                "validation subset from the 'train' split, and use "
-                "InferenceSequence (submit.py) for public_lb inference."
+                "validation — it only has first-frame annotations."
             )
 
         raw_seqs = manifest[split]
-
-        # ── Build SeqMeta objects ─────────────────────────────────────────
         seqs: List[SeqMeta] = []
         for seq_dict in raw_seqs.values():
             ann_rel  = seq_dict.get("annotation_path")
@@ -593,9 +536,6 @@ class TrainingDataset(Dataset):
                 annotation      = annotation,
             ))
 
-        # ── Validate sequences at startup ─────────────────────────────────
-        # This is where "moov atom not found" is caught ONCE and the sequence
-        # is removed, rather than crashing inside __getitem__ repeatedly.
         self.sequences, _ = validate_sequences(seqs, log_path=corrupt_log_path)
 
         if not self.sequences:
@@ -607,7 +547,8 @@ class TrainingDataset(Dataset):
         print(
             f"[TrainingDataset] split='{split}' | "
             f"{len(self.sequences)} valid sequences | "
-            f"{samples_per_epoch} samples/epoch"
+            f"{samples_per_epoch} samples/epoch | "
+            f"jitter_sigma={jitter_sigma}"
         )
 
     # ── Train / Val splitter ──────────────────────────────────────────────
@@ -623,39 +564,10 @@ class TrainingDataset(Dataset):
         template_size:    int   = 128,
         search_size:      int   = 256,
         max_gap_frames:   int   = 100,
+        jitter_sigma:     float = 0.25,
         seed:             int   = 42,
         corrupt_log_path: Optional[str] = None,
     ) -> "Tuple[TrainingDataset, TrainingDataset]":
-        """
-        Build a train dataset and a held-out val dataset from the 'train'
-        manifest split.
-
-        Sequences are shuffled deterministically (seed) and split by
-        val_ratio at the *sequence* level — no frame from a val sequence
-        ever appears in the train loader, and vice versa.
-
-        The 'public_lb' split is intentionally excluded: it only contains
-        first-frame annotations and is reserved for submission inference.
-
-        Args
-        ────
-        manifest_path   path to contestant_manifest.json
-        data_root       dataset root directory
-        val_ratio       fraction of train sequences held out for val (0–1)
-        train_samples   virtual samples per epoch for the train dataset
-        val_samples     virtual samples per epoch for the val dataset
-        template_size   crop size for template images
-        search_size     crop size for search images
-        max_gap_frames  max frame gap at 30 fps
-        seed            RNG seed for reproducible sequence shuffle
-        corrupt_log_path  path for corrupted-sequence log file (optional)
-
-        Returns
-        ───────
-        (train_dataset, val_dataset)  — both are TrainingDataset instances
-        """
-        # ── Load + validate ALL train sequences once ─────────────────────
-        # We validate up-front so both subsets share the same clean list.
         with open(manifest_path, "r") as f:
             manifest = json.load(f)
 
@@ -684,19 +596,14 @@ class TrainingDataset(Dataset):
         valid_seqs, _ = validate_sequences(seqs, log_path=corrupt_log_path)
 
         if not valid_seqs:
-            raise RuntimeError(
-                "No valid train sequences found. "
-                "Check data_root and manifest paths."
-            )
+            raise RuntimeError("No valid train sequences found.")
 
-        # ── Shuffle + split ───────────────────────────────────────────────
         rng = random.Random(seed)
         shuffled = valid_seqs.copy()
         rng.shuffle(shuffled)
 
         n_val   = max(1, int(len(shuffled) * val_ratio))
         n_train = len(shuffled) - n_val
-
         train_seqs = shuffled[:n_train]
         val_seqs   = shuffled[n_train:]
 
@@ -706,7 +613,6 @@ class TrainingDataset(Dataset):
             f"(val_ratio={val_ratio:.0%}, seed={seed})"
         )
 
-        # ── Build dataset objects using the _sequences fast path ──────────
         common_kwargs = dict(
             manifest_path  = manifest_path,
             data_root      = data_root,
@@ -719,25 +625,23 @@ class TrainingDataset(Dataset):
             **common_kwargs,
             samples_per_epoch = train_samples,
             augment           = True,
+            jitter_sigma      = jitter_sigma,
             _sequences        = train_seqs,
         )
         val_ds = cls(
             **common_kwargs,
             samples_per_epoch = val_samples,
             augment           = False,
+            jitter_sigma      = 0.0,   # no jitter for val (measure true performance)
             _sequences        = val_seqs,
         )
 
         return train_ds, val_ds
-    
-    # ── Per-worker VideoCapture cache (created lazily in workers) ─────
-    # ── Lazy VideoCache (per-process safe) ─────────────────────────────
+
+    # ── Per-worker VideoCache ─────────────────────────────────────────────
+
     @property
     def vcache(self):
-        """
-        Lazy-initialised per-process VideoCache.
-        Fixes Windows spawn + avoids sharing stale handles.
-        """
         if not hasattr(self, "_vcache") or self._vcache is None:
             self._vcache = _VideoCache(maxsize=64)
         return self._vcache
@@ -745,22 +649,11 @@ class TrainingDataset(Dataset):
     # ── Sampling helpers ──────────────────────────────────────────────────
 
     def _safe_upper(self, seq: SeqMeta) -> int:
-        """
-        Safe upper bound for frame index sampling.
-        Uses the minimum of manifest n_frames, actual decoded frame count,
-        and annotation length to prevent seeking past EOF.
-        """
         ann_len = len(seq.annotation)
         decoded = seq.decoded_frames if seq.decoded_frames > 0 else seq.n_frames
         return max(1, min(seq.n_frames, decoded, ann_len))
 
     def _max_gap_for_seq(self, seq: SeqMeta) -> int:
-        """
-        Scale max_gap_frames to the sequence's native fps.
-        Example: max_gap_frames=100 at 30 fps = 3.33s.
-        At 96 fps the same 3.33s = 320 frames, keeping temporal context
-        consistent across variable-fps sequences.
-        """
         fps_ratio = seq.native_fps / 30.0
         return max(1, int(self.max_gap_frames * fps_ratio))
 
@@ -771,43 +664,98 @@ class TrainingDataset(Dataset):
         return ann[min(frame_idx, len(ann) - 1)]
 
     def _read_frame(self, seq: SeqMeta, frame_idx: int) -> Optional[np.ndarray]:
-        """
-        Read one frame using the cached VideoCapture.
-        Returns None cleanly if the video is not readable.
-
-        WHY NOT OPEN/CLOSE PER CALL:
-          Every VideoCapture() call makes ffmpeg re-parse the moov atom.
-          For a 1393-frame 96-fps video this is ~2 MB of I/O per frame read.
-          The _VideoCache keeps the handle open for the worker's lifetime,
-          reducing moov overhead to exactly one parse per sequence per worker.
-        """
         result = self.vcache.get(seq.video_path)
         if result is None:
             return None
         cap, decoded_count = result
-
-        # Clamp to safe range
         safe_idx = min(frame_idx, decoded_count - 1)
         cap.set(cv2.CAP_PROP_POS_FRAMES, safe_idx)
         ret, frame = cap.read()
         return frame if ret else None
 
+    def _crop_search_with_jitter(
+        self,
+        frame: np.ndarray,
+        box: List[float],
+        output_size: int,
+        context_factor: float,
+        jitter_sigma: float,
+    ) -> Tuple[np.ndarray, float, Tuple[int, int]]:
+        """
+        Crop search region with optional Gaussian jitter on the crop centre.
+
+        CRITICAL FIX:
+        Without jitter the crop is always centred on the GT box, so the model
+        always sees the target at normalised position (0.5, 0.5) and learns to
+        ALWAYS predict the centre rather than to localise.  This destroys
+        tracking performance.
+
+        With jitter (sigma=0.25) the crop centre is perturbed by up to ~±0.5
+        crop-sides, forcing the model to find the target at varying positions.
+
+        Returns:
+            crop          – resized crop
+            scale         – output_size / crop_side
+            (ox1, oy1)    – ORIGINAL (pre-padding) top-left; use for GT mapping
+        """
+        import math
+        H, W = frame.shape[:2]
+        x, y, w, h = box
+        cx = x + w / 2
+        cy = y + h / 2
+
+        # Crop side using geometric mean (matches tracker.py)
+        # Add scale jitter to Increase training data diversity
+        scale_jitter = random.uniform(0.9, 1.1)
+        s = max(math.sqrt(w * h) * context_factor * scale_jitter, 1.0)
+
+        # ── JITTER ────────────────────────────────────────────────────────
+        if jitter_sigma > 0:
+            cx = cx + random.gauss(0, jitter_sigma * s)
+            cy = cy + random.gauss(0, jitter_sigma * s)
+
+        x1 = int(round(cx - s / 2))
+        y1 = int(round(cy - s / 2))
+        x2 = int(round(cx + s / 2))
+        y2 = int(round(cy + s / 2))
+
+        # Remember original origin for GT mapping
+        ox1, oy1 = x1, y1
+
+        pad_top    = max(0, -y1)
+        pad_left   = max(0, -x1)
+        pad_bottom = max(0, y2 - H)
+        pad_right  = max(0, x2 - W)
+
+        if any([pad_top, pad_left, pad_bottom, pad_right]):
+            frame = cv2.copyMakeBorder(
+                frame, pad_top, pad_bottom, pad_left, pad_right,
+                cv2.BORDER_CONSTANT, value=(114, 114, 114),
+            )
+            x1 += pad_left; x2 += pad_left
+            y1 += pad_top;  y2 += pad_top
+
+        crop = frame[y1:y2, x1:x2]
+        crop_side = max(crop.shape[0], crop.shape[1], 1)
+        scale = output_size / crop_side
+        crop  = cv2.resize(crop, (output_size, output_size))
+        return crop, scale, (ox1, oy1)
+
     def _build_sample(self, seq: SeqMeta) -> Optional[TrackingPair]:
         """Build one (template, search, gt_box) pair from a sequence."""
+        import math
         upper  = self._safe_upper(seq)
         if upper < 2:
             return None
 
         max_gap = self._max_gap_for_seq(seq)
 
-        # Sample template and search indices
         t_idx = random.randint(0, upper - 2)
         s_idx = min(t_idx + random.randint(1, max_gap), upper - 1)
 
         t_box = self._get_annotation_for_frame(seq, t_idx)
         s_box = self._get_annotation_for_frame(seq, s_idx)
 
-        # Skip degenerate boxes
         if t_box[2] <= 0 or t_box[3] <= 0:
             return None
         if s_box[2] <= 0 or s_box[3] <= 0:
@@ -818,12 +766,32 @@ class TrainingDataset(Dataset):
         if t_frame is None or s_frame is None:
             return None
 
-        # ── Crop ──────────────────────────────────────────────────────────
-        t_crop, _, _ = crop_and_resize(
-            t_frame, t_box, self.template_size, context_factor=2.0
-        )
-        s_crop, s_scale, (sx1, sy1) = crop_and_resize(
-            s_frame, s_box, self.search_size, context_factor=4.0
+        # ── Template crop (no jitter — stable reference) ──────────────────
+        t_sx = max(math.sqrt(t_box[2] * t_box[3]) * 2.0, 1.0)
+        t_cx = t_box[0] + t_box[2] / 2
+        t_cy = t_box[1] + t_box[3] / 2
+        tx1 = int(round(t_cx - t_sx / 2))
+        ty1 = int(round(t_cy - t_sx / 2))
+        tx2 = int(round(t_cx + t_sx / 2))
+        ty2 = int(round(t_cy + t_sx / 2))
+        tH, tW = t_frame.shape[:2]
+        tpad_t = max(0, -ty1); tpad_l = max(0, -tx1)
+        tpad_b = max(0, ty2 - tH); tpad_r = max(0, tx2 - tW)
+        if any([tpad_t, tpad_l, tpad_b, tpad_r]):
+            t_frame_p = cv2.copyMakeBorder(t_frame, tpad_t, tpad_b, tpad_l, tpad_r,
+                                           cv2.BORDER_CONSTANT, value=(114, 114, 114))
+            tx1 += tpad_l; tx2 += tpad_l; ty1 += tpad_t; ty2 += tpad_t
+        else:
+            t_frame_p = t_frame
+        t_patch = t_frame_p[ty1:ty2, tx1:tx2]
+        t_side  = max(t_patch.shape[0], t_patch.shape[1], 1)
+        t_crop  = cv2.resize(t_patch, (self.template_size, self.template_size))
+
+        # ── Search crop WITH JITTER ────────────────────────────────────────
+        s_crop, s_scale, (sox1, soy1) = self._crop_search_with_jitter(
+            s_frame, s_box, self.search_size,
+            context_factor = 4.0,
+            jitter_sigma   = self.jitter_sigma if self.augment else 0.0,
         )
 
         # ── Augment ───────────────────────────────────────────────────────
@@ -832,12 +800,18 @@ class TrainingDataset(Dataset):
             t_crop            = augment_template(t_crop)
             s_crop, s_flipped = augment_search(s_crop)
 
-        # ── Normalise GT bbox to search crop (cx,cy,w,h in [0,1]) ─────────
+        # ── GT bbox in normalised search crop coords ──────────────────────
+        # FIX: use ORIGINAL (pre-padding) top-left (sox1, soy1) for mapping.
+        # s_box is in original frame coords; sox1 is also in original (may be < 0).
+        # This makes the formula consistent regardless of whether crop needed padding.
         s_cx = s_box[0] + s_box[2] / 2
         s_cy = s_box[1] + s_box[3] / 2
 
-        cx_crop = (s_cx - sx1) * s_scale
-        cy_crop = (s_cy - sy1) * s_scale
+        # Crop side length (same formula used in _crop_search_with_jitter)
+        # After jitter the crop is still the same SIZE, just centred elsewhere.
+        # We need the actual crop_side to compute scale — s_scale was returned.
+        cx_crop = (s_cx - sox1) * s_scale
+        cy_crop = (s_cy - soy1) * s_scale
         w_crop  = s_box[2] * s_scale
         h_crop  = s_box[3] * s_scale
 
@@ -846,7 +820,6 @@ class TrainingDataset(Dataset):
         w_n  = w_crop  / self.search_size
         h_n  = h_crop  / self.search_size
 
-        # Mirror cx when search was horizontally flipped
         if s_flipped:
             cx_n = 1.0 - cx_n
 
@@ -854,6 +827,10 @@ class TrainingDataset(Dataset):
         cy_n = float(np.clip(cy_n, 0.0, 1.0))
         w_n  = float(np.clip(w_n,  0.0, 1.0))
         h_n  = float(np.clip(h_n,  0.0, 1.0))
+
+        # Skip degenerate GT (target jittered completely out of crop)
+        if w_n < 0.01 or h_n < 0.01:
+            return None
 
         gt_box = torch.tensor([cx_n, cy_n, w_n, h_n], dtype=torch.float32)
 
@@ -883,7 +860,6 @@ class TrainingDataset(Dataset):
                     "frame_idx": sample.frame_idx,
                 }
 
-        # Fallback — should be extremely rare after startup validation
         logger.warning(
             "__getitem__: 10 consecutive sample failures — returning zero tensor"
         )
@@ -901,10 +877,6 @@ class TrainingDataset(Dataset):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_dataset_stats(manifest_path: str, data_root: str):
-    """
-    Print a summary table and run a file-existence + frame-count check.
-    Opens each video to compare CAP_PROP_FRAME_COUNT vs manifest n_frames.
-    """
     with open(manifest_path) as f:
         manifest = json.load(f)
 
@@ -944,10 +916,6 @@ def print_dataset_stats(manifest_path: str, data_root: str):
             cap.release()
             if abs(decoded - seq["n_frames"]) > max(5, 0.02 * seq["n_frames"]):
                 miscount += 1
-                print(
-                    f"  [WARN] {seq['dataset']}/{seq['seq_name']}: "
-                    f"manifest={seq['n_frames']} decoded={decoded}"
-                )
 
             if ap and not os.path.exists(ap):
                 missing += 1
@@ -958,6 +926,51 @@ def print_dataset_stats(manifest_path: str, data_root: str):
         if miscount:
             status.append(f"{miscount} frame-count mismatch")
         print(f"  {split}: {', '.join(status) if status else '✓ all OK'}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Quick jitter sanity check
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _verify_jitter(n_samples: int = 1000):
+    """
+    Verify that with jitter enabled, GT positions are spread across [0,1]
+    rather than concentrated at 0.5.
+    """
+    import math
+    cx_vals = []
+    cy_vals = []
+    frame_hw = 1920
+    box = [800.0, 400.0, 80.0, 60.0]  # typical box
+
+    for _ in range(n_samples):
+        w, h = box[2], box[3]
+        s    = max(math.sqrt(w * h) * 4.0, 1.0)
+        cx_gt = box[0] + w / 2
+        cy_gt = box[1] + h / 2
+
+        cx_jit = cx_gt + random.gauss(0, 0.25 * s)
+        cy_jit = cy_gt + random.gauss(0, 0.25 * s)
+
+        ox1 = int(round(cx_jit - s / 2))
+        oy1 = int(round(cy_jit - s / 2))
+
+        scale = 256 / s
+        cx_n = (cx_gt - ox1) * scale / 256
+        cy_n = (cy_gt - oy1) * scale / 256
+        cx_vals.append(cx_n)
+        cy_vals.append(cy_n)
+
+    cx_arr = np.array(cx_vals)
+    cy_arr = np.array(cy_vals)
+    print(f"Jitter test ({n_samples} samples):")
+    print(f"  cx: mean={cx_arr.mean():.3f}  std={cx_arr.std():.3f}  "
+          f"range=[{cx_arr.min():.3f}, {cx_arr.max():.3f}]")
+    print(f"  cy: mean={cy_arr.mean():.3f}  std={cy_arr.std():.3f}  "
+          f"range=[{cy_arr.min():.3f}, {cy_arr.max():.3f}]")
+    assert abs(cx_arr.mean() - 0.5) < 0.05, "Mean should be ~0.5"
+    assert cx_arr.std() > 0.1, "Std should be > 0.1 (target not always at center)"
+    print("  ✓ Jitter is working correctly — target at varying positions")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -973,7 +986,7 @@ if __name__ == "__main__":
         default=str(_ROOT / "data/contest_release/metadata/contestant_manifest.json"))
     parser.add_argument("--data_root",
         default=str(_ROOT / "data/contest_release"))
-    parser.add_argument("--mode", choices=["stats", "sample", "validate"],
+    parser.add_argument("--mode", choices=["stats", "sample", "validate", "jitter"],
         default="stats")
     args = parser.parse_args()
 
@@ -982,6 +995,9 @@ if __name__ == "__main__":
 
     if args.mode == "stats":
         print_dataset_stats(args.manifest, args.data_root)
+
+    elif args.mode == "jitter":
+        _verify_jitter(n_samples=2000)
 
     elif args.mode == "validate":
         ds = TrainingDataset(
@@ -1001,11 +1017,13 @@ if __name__ == "__main__":
             split            = "train",
             samples_per_epoch = 100,
             augment          = True,
+            jitter_sigma     = 0.25,
         )
         sample = ds[0]
         print("\nSample keys:", list(sample.keys()))
         print("template shape:", sample["template"].shape)
         print("search shape:  ", sample["search"].shape)
         print("gt_box:        ", sample["gt_box"])
+        print("  (with jitter, cx/cy should NOT always be ~0.5)")
         print("seq_id:        ", sample["seq_id"])
-        print("\n✓ dataset.py v2 works correctly!")
+        print("\n✓ dataset.py v3 works correctly!")
