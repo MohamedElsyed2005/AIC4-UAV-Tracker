@@ -1,15 +1,24 @@
+"""
+submit.py  —  Production HiFT Tracker (Fixed v2)
+Fixes applied:
+  1. decode_prediction: uses cls2 peak + grid_sample on loc map (spatial decode).
+  2. EMA_CENTRE lowered from 0.55 → 0.35 to reduce lag on fast UAV motion.
+  3. Panic mode: runs both tmpl_orig and tmpl_dyn, picks best confidence.
+  4. Added run_all_sequences() to produce a single submission.csv covering
+     every sequence in every split — required for the actual competition submit.
+"""
 import argparse
 import csv
 import json
+import math
 import sys
-import time
 from pathlib import Path
 
-import torch
 import cv2
 import numpy as np
+import torch
+import torch.nn.functional as F
 
-# ─────────────────────────────────────────────
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
@@ -17,214 +26,377 @@ if str(_ROOT) not in sys.path:
 from data.dataset import InferenceSequence
 from models.hift_full import HiFT
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────────────────────────────────────
+TMPL_SIZE         = 128
+SRCH_SIZE         = 256
+CONTEXT_TMPL      = 2.0
+CONTEXT_SRCH      = 4.0
 
-# ─────────────────────────────────────────────
-def to_float(x):
-    """Force tensor/np/python → float"""
-    if isinstance(x, torch.Tensor):
-        return float(x.item())
-    return float(x)
+CONF_THRESH       = 0.40
+DIST_GATE_RATIO   = 3.0
+SCALE_GATE_MAX    = 1.50   # tightened from 1.60
+SCALE_GATE_MIN    = 0.60   # tightened from 0.55
 
+# FIX: lowered from 0.55 → 0.35 to track fast-moving UAV targets without lag
+EMA_CENTRE        = 0.35
+EMA_SIZE          = 0.75   # slightly more responsive size updates
 
-def to_box_list(box):
-    """Ensure box is pure python list of floats"""
-    return [to_float(v) for v in box]
+TMPL_UPDATE_K     = 60
+# FIX: lowered from 0.75 → 0.58 so dynamic template actually updates once
+#      the cls2 head is trained (previously rarely triggered)
+TMPL_UPDATE_CONF  = 0.58
 
+FROZEN_LIMIT      = 5
+PANIC_FROZEN_LIMIT = 15
+MAX_TRAVEL_BOXES  = 150.0
 
-# ─────────────────────────────────────────────
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", required=True)
-    p.add_argument("--manifest", default="data/contest_release/metadata/contestant_manifest.json")
-    p.add_argument("--data_root", default="data/contest_release")
-    p.add_argument("--output", default="submission.csv")
-    p.add_argument("--video_output", default="result.mp4")
-    p.add_argument("--device", default="cuda")
-    p.add_argument("--split", default="public_lb")
-    p.add_argument("--seq_id", required=True)
-    p.add_argument("--max_frames", type=int, default=None)
-    return p.parse_args()
-
-
-# ─────────────────────────────────────────────
-def draw_box(frame, box):
-    x, y, w, h = map(int, box)
-    return cv2.rectangle(frame.copy(), (x, y), (x + w, y + h), (0, 255, 0), 2)
+_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
-# ─────────────────────────────────────────────
-def get_crop(frame, center, size):
-    """SAFE crop (forces float)"""
-    cx = to_float(center[0])
-    cy = to_float(center[1])
+# ──────────────────────────────────────────────────────────────────────────────
+# Image utilities
+# ──────────────────────────────────────────────────────────────────────────────
+def _crop_resize(frame: np.ndarray, cx: float, cy: float, s: float, out_size: int):
+    H, W = frame.shape[:2]
+    x1 = int(round(cx - s / 2));  y1 = int(round(cy - s / 2))
+    x2 = int(round(cx + s / 2));  y2 = int(round(cy + s / 2))
+    ox1, oy1 = x1, y1
 
-    h, w = frame.shape[:2]
-    half = size // 2
+    pt = max(0, -y1);  pl = max(0, -x1)
+    pb = max(0, y2-H); pr = max(0, x2-W)
 
-    x1, x2 = int(cx - half), int(cx + half)
-    y1, y2 = int(cy - half), int(cy + half)
+    if pt or pl or pb or pr:
+        frame = cv2.copyMakeBorder(frame, pt, pb, pl, pr,
+                                   cv2.BORDER_CONSTANT, value=(114, 114, 114))
+        x1 += pl; x2 += pl; y1 += pt; y2 += pt
 
-    pad_l = max(0, -x1)
-    pad_r = max(0, x2 - w)
-    pad_t = max(0, -y1)
-    pad_b = max(0, y2 - h)
-
-    x1c, x2c = max(0, x1), min(w, x2)
-    y1c, y2c = max(0, y1), min(h, y2)
-
-    crop = frame[y1c:y2c, x1c:x2c]
-
-    if pad_l or pad_r or pad_t or pad_b:
-        crop = cv2.copyMakeBorder(
-            crop, pad_t, pad_b, pad_l, pad_r,
-            cv2.BORDER_CONSTANT, value=(114, 114, 114)
-        )
-
-    return crop
+    patch = frame[y1:y2, x1:x2]
+    side_real = max(patch.shape[0], patch.shape[1], 1)
+    crop = cv2.resize(patch, (out_size, out_size))
+    return crop, float(side_real), ox1, oy1
 
 
-# ─────────────────────────────────────────────
-def preprocess_crop(crop, size):
-    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    rgb = (rgb - mean) / std
-    return torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0)
+def _to_tensor(img: np.ndarray) -> torch.Tensor:
+    img = img[:, :, ::-1].copy().astype(np.float32) / 255.0
+    img = (img - _MEAN) / _STD
+    return torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0)
 
 
-# ─────────────────────────────────────────────
-def decode_loc(loc, size):
-    pred = torch.sigmoid(loc.mean(dim=(2, 3))).squeeze(0)
-
-    if isinstance(pred, torch.Tensor):
-        pred = pred.detach().cpu().numpy()
-
-    cx, cy, w, h = pred
-    return [
-        cx * size - (w * size) / 2,
-        cy * size - (h * size) / 2,
-        w * size,
-        h * size
-    ]
+def _box_floats(box) -> list:
+    return [float(v) for v in box]
 
 
-# ─────────────────────────────────────────────
+def draw_box(frame, box, color=(0, 255, 0), thickness=2):
+    x, y, w, h = [int(round(float(v))) for v in box]
+    out = frame.copy()
+    cv2.rectangle(out, (x, y), (x + w, y + h), color, thickness)
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FIXED: decode_prediction
+# ──────────────────────────────────────────────────────────────────────────────
+def decode_prediction(loc: torch.Tensor, cls2: torch.Tensor,
+                      s_orig: float, ox1: float, oy1: float):
+    """
+    Decode HiFT output maps into a bounding box and confidence score.
+
+    FIX (v2):
+    - Previously took loc[0] as if it were shape [4], discarding spatial dims.
+    - Now:
+        1. Find the peak cell in the cls2 score map.
+        2. Sample the loc map at that cell using grid_sample (same as training).
+        3. Apply sigmoid to get normalised [cx,cy,w,h] in [0,1] crop coords.
+        4. Back-project to frame coords using s_orig and (ox1, oy1).
+
+    loc  : [1, 4, H, W]  raw logits from localization head
+    cls2 : [1, 1, H, W]  raw logits from classification head
+    s_orig : crop side length in original frame pixels
+    ox1, oy1 : top-left of crop in ORIGINAL (pre-padding) frame coords
+    """
+    with torch.no_grad():
+        # ── Confidence: sigmoid on cls2, find peak ─────────────────────────
+        score_map = torch.sigmoid(cls2[0, 0]).cpu().float()   # [H, W]
+        score_np  = score_map.numpy()
+        conf      = float(score_np.max())
+
+        H, W = score_np.shape
+
+        # ── Peak location in normalised [-1,1] for grid_sample ──────────────
+        flat_idx  = int(score_np.argmax())
+        peak_row  = flat_idx // W   # row index  (y direction)
+        peak_col  = flat_idx  % W   # col index  (x direction)
+
+        # Cell centre in [0,1] crop coords
+        cx_peak_n = (peak_col + 0.5) / W
+        cy_peak_n = (peak_row + 0.5) / H
+
+        # Convert to grid_sample coords [-1, 1]
+        gx = torch.tensor(2.0 * cx_peak_n - 1.0).view(1, 1, 1, 1)
+        gy = torch.tensor(2.0 * cy_peak_n - 1.0).view(1, 1, 1, 1)
+        grid = torch.cat([gx, gy], dim=-1)                    # [1,1,1,2]
+
+        # Sample loc at peak position: [1,4,H,W] → [1,4,1,1] → [4]
+        loc_cpu = loc.cpu().float()
+        pred = F.grid_sample(loc_cpu, grid, mode='bilinear',
+                             padding_mode='border', align_corners=False)
+        pred = torch.sigmoid(pred).view(4)                    # [cx_n,cy_n,w_n,h_n]
+
+        cx_n, cy_n, w_n, h_n = pred.tolist()
+
+        # ── Back-project to frame coordinates ──────────────────────────────
+        cx_frame = cx_n * s_orig + ox1
+        cy_frame = cy_n * s_orig + oy1
+        w_frame  = w_n  * s_orig
+        h_frame  = h_n  * s_orig
+
+        x_frame  = cx_frame - w_frame / 2
+        y_frame  = cy_frame - h_frame / 2
+
+    return [x_frame, y_frame, w_frame, h_frame], conf
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tracker
+# ──────────────────────────────────────────────────────────────────────────────
 class HiFTTracker:
-    def __init__(self, model, device="cuda"):
-        self.model = model
+    def __init__(self, model: HiFT, device: str = "cuda"):
+        self.model  = model
         self.device = device
-        self.template = None
-        self.prev_box = None
-        self.tmpl_size = 128
-        self.search_size = 256
+        model.eval()
 
-    def initialize(self, frame, box):
-        box = to_box_list(box)
+        self._tmpl_orig: torch.Tensor | None = None
+        self._tmpl_dyn:  torch.Tensor | None = None
 
-        cx = box[0] + box[2] / 2
-        cy = box[1] + box[3] / 2
+        self._raw_box    = None
+        self._smooth_cx  = None
+        self._smooth_cy  = None
+        self._smooth_w   = None
+        self._smooth_h   = None
 
-        crop = get_crop(frame, (cx, cy), self.tmpl_size)
-        self.template = preprocess_crop(crop, self.tmpl_size).to(self.device)
+        self._init_box = None
+        self._init_cx  = None
+        self._init_cy  = None
 
-        self.prev_box = box
+        self._last_good_box = None
+        self._frozen_count  = 0
+        self._frame_count   = 0
 
-    def track(self, frame):
-        cx = to_float(self.prev_box[0] + self.prev_box[2] / 2)
-        cy = to_float(self.prev_box[1] + self.prev_box[3] / 2)
+    def _make_template(self, frame: np.ndarray, box: list) -> torch.Tensor:
+        x, y, w, h = box
+        cx = x + w / 2;  cy = y + h / 2
+        s  = max(math.sqrt(w * h) * CONTEXT_TMPL, 4.0)
+        crop, *_ = _crop_resize(frame, cx, cy, s, TMPL_SIZE)
+        return _to_tensor(crop).to(self.device)
 
-        search = get_crop(frame, (cx, cy), self.search_size)
-        search = preprocess_crop(search, self.search_size).to(self.device)
+    def _make_search(self, frame: np.ndarray, box: list, expand: float = 1.0):
+        x, y, w, h = box
+        cx = x + w / 2;  cy = y + h / 2
+        s  = max(math.sqrt(w * h) * CONTEXT_SRCH * expand, 8.0)
+        crop, s_orig, ox1, oy1 = _crop_resize(frame, cx, cy, s, SRCH_SIZE)
+        return _to_tensor(crop).to(self.device), s_orig, ox1, oy1
 
+    def initialize(self, frame: np.ndarray, box: list):
+        box = _box_floats(box)
+        x, y, w, h = box
+
+        self._raw_box   = box
+        self._smooth_cx = x + w / 2
+        self._smooth_cy = y + h / 2
+        self._smooth_w  = w
+        self._smooth_h  = h
+
+        self._init_box = box.copy()
+        self._init_cx  = x + w / 2
+        self._init_cy  = y + h / 2
+
+        self._last_good_box = box
+        self._frozen_count  = 0
+        self._frame_count   = 0
+
+        self._tmpl_orig = self._make_template(frame, box)
+        self._tmpl_dyn  = self._tmpl_orig.clone()
+
+    def _run_model(self, tmpl: torch.Tensor, srch: torch.Tensor,
+                   s_orig: float, ox1: float, oy1: float):
+        """Run one forward pass and return (box, conf)."""
         with torch.no_grad():
-            loc, _, _ = self.model(self.template, search)
+            loc, _, cls2 = self.model(tmpl, srch)
+        return decode_prediction(loc, cls2, s_orig, ox1, oy1)
 
-        box = decode_loc(loc, self.search_size)
+    def track(self, frame: np.ndarray):
+        self._frame_count += 1
+        H, W = frame.shape[:2]
 
-        cx0 = cx - self.search_size / 2
-        cy0 = cy - self.search_size / 2
+        # ── SEARCH STRATEGY ─────────────────────────────────────────────────
+        is_panic = False
+        if self._frozen_count > PANIC_FROZEN_LIMIT:
+            # PANIC MODE: scan entire frame
+            s_full = max(H, W) * 1.1
+            crop, s_orig, ox1, oy1 = _crop_resize(frame, W/2, H/2, s_full, SRCH_SIZE)
+            srch_t = _to_tensor(crop).to(self.device)
+            conf_thresh_use = 0.20
+            is_panic = True
+        elif self._frozen_count >= FROZEN_LIMIT * 3:
+            search_box = self._last_good_box
+            srch_t, s_orig, ox1, oy1 = self._make_search(frame, search_box, 2.5)
+            conf_thresh_use = 0.30
+        elif self._frozen_count >= FROZEN_LIMIT:
+            search_box = self._last_good_box
+            srch_t, s_orig, ox1, oy1 = self._make_search(frame, search_box, 1.8)
+            conf_thresh_use = 0.35
+        else:
+            search_box = self._raw_box
+            srch_t, s_orig, ox1, oy1 = self._make_search(frame, search_box, 1.0)
+            conf_thresh_use = CONF_THRESH
 
-        x = box[0] + cx0
-        y = box[1] + cy0
-        w = box[2]
-        h = box[3]
+        # ── INFERENCE ───────────────────────────────────────────────────────
+        box_pred, conf = self._run_model(self._tmpl_dyn, srch_t, s_orig, ox1, oy1)
 
-        if self.prev_box is not None:
-            sf = 0.6
-            x = sf * self.prev_box[0] + (1 - sf) * x
-            y = sf * self.prev_box[1] + (1 - sf) * y
-            w = sf * self.prev_box[2] + (1 - sf) * w
-            h = sf * self.prev_box[3] + (1 - sf) * h
+        # FIX: In panic mode, also try the original template and keep the best.
+        # This helps re-detection when the dynamic template has drifted badly.
+        if is_panic:
+            box_orig, conf_orig = self._run_model(
+                self._tmpl_orig, srch_t, s_orig, ox1, oy1
+            )
+            if conf_orig > conf:
+                box_pred, conf = box_orig, conf_orig
 
-        self.prev_box = [x, y, w, h]
-        return self.prev_box
+        px, py, pw, ph = box_pred
+
+        if pw < 5 or ph < 5:
+            conf = 0.0
+
+        # ── GATING ──────────────────────────────────────────────────────────
+        rx, ry, rw, rh = self._raw_box
+        prev_cx = rx + rw / 2;  prev_cy = ry + rh / 2
+        new_cx  = px + pw / 2;  new_cy  = py + ph / 2
+
+        dist = math.sqrt((new_cx - prev_cx) ** 2 + (new_cy - prev_cy) ** 2)
+
+        if is_panic:
+            dist_ok = True
+        elif self._frozen_count > 0:
+            dist_ok = dist <= max(rw, rh) * 6.0
+        else:
+            dist_ok = dist <= max(rw, rh) * DIST_GATE_RATIO
+
+        scale_w  = pw / (rw + 1e-6)
+        scale_h  = ph / (rh + 1e-6)
+        scale_ok = (SCALE_GATE_MIN <= scale_w <= SCALE_GATE_MAX and
+                    SCALE_GATE_MIN <= scale_h <= SCALE_GATE_MAX)
+
+        dist_from_init = math.sqrt((new_cx - self._init_cx) ** 2 +
+                                   (new_cy - self._init_cy) ** 2)
+        max_travel = max(self._init_box[2], self._init_box[3]) * MAX_TRAVEL_BOXES
+        anchor_ok  = dist_from_init <= max_travel
+
+        conf_ok = conf >= conf_thresh_use
+
+        if is_panic:
+            prediction_good = conf_ok and pw > 10 and ph > 10
+        else:
+            prediction_good = conf_ok and dist_ok and scale_ok and anchor_ok
+
+        if prediction_good:
+            self._frozen_count = 0
+            self._raw_box      = box_pred
+            self._last_good_box = box_pred
+
+            # FIX: EMA_CENTRE=0.35 (was 0.55) → tracks fast targets without lag
+            self._smooth_cx = EMA_CENTRE * self._smooth_cx + (1 - EMA_CENTRE) * new_cx
+            self._smooth_cy = EMA_CENTRE * self._smooth_cy + (1 - EMA_CENTRE) * new_cy
+            self._smooth_w  = EMA_SIZE   * self._smooth_w  + (1 - EMA_SIZE)   * pw
+            self._smooth_h  = EMA_SIZE   * self._smooth_h  + (1 - EMA_SIZE)   * ph
+
+            if self._frame_count % TMPL_UPDATE_K == 0 and conf >= TMPL_UPDATE_CONF:
+                self._tmpl_dyn = self._make_template(frame, box_pred)
+        else:
+            self._frozen_count += 1
+
+        out_x = self._smooth_cx - self._smooth_w / 2
+        out_y = self._smooth_cy - self._smooth_h / 2
+        return [out_x, out_y, self._smooth_w, self._smooth_h], conf
 
 
-# ─────────────────────────────────────────────
-def main():
-    args = parse_args()
-
-    print("[load] HiFT model")
-    model = HiFT().to(args.device)
-    model.load_pretrained(args.checkpoint, device=args.device)
-    model.eval()
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Single-sequence runner (for debugging / visualising one sequence)
+# ──────────────────────────────────────────────────────────────────────────────
+def run_single_sequence(args, model):
     tracker = HiFTTracker(model, args.device)
 
     with open(args.manifest) as f:
         manifest = json.load(f)
 
-    sequences = manifest[args.split]
-
     seq_info = None
-    for v in sequences.values():
-        if f"{v['dataset']}/{v['seq_name']}" == args.seq_id:
-            seq_info = v
+    for split_seqs in manifest.values():
+        if not isinstance(split_seqs, dict):
+            continue
+        for v in split_seqs.values():
+            if f"{v['dataset']}/{v['seq_name']}" == args.seq_id:
+                seq_info = v
+                break
+        if seq_info:
             break
 
-    seq = InferenceSequence(seq_info, args.data_root)
-    frame0, box0 = seq.get_init()
+    if seq_info is None:
+        raise ValueError(f"Sequence '{args.seq_id}' not found in manifest.")
 
-    tracker.initialize(frame0, box0)
+    seq    = InferenceSequence(seq_info, args.data_root)
+    frame0, box0 = seq.get_init()
+    tracker.initialize(frame0, _box_floats(box0))
 
     H, W = frame0.shape[:2]
-    out = cv2.VideoWriter(args.video_output,
-                          cv2.VideoWriter_fourcc(*"mp4v"),
-                          30, (W, H))
+    save_video = args.video_output.strip() != ""
+    vout = None
+    if save_video:
+        vout = cv2.VideoWriter(args.video_output,
+                               cv2.VideoWriter_fourcc(*"mp4v"), 30, (W, H))
+        if not vout.isOpened():
+            print("[WARN] Video writer failed")
+            save_video = False
 
     csv_rows = []
+    if save_video:
+        vout.write(draw_box(frame0, box0))
+    csv_rows.append((f"{args.seq_id}_0",
+                     *[int(round(float(v))) for v in box0]))
 
-    out.write(draw_box(frame0, box0))
-    csv_rows.append((f"{args.seq_id}_0", *map(int, box0)))
-
-    max_frames = args.max_frames or seq_info.get("n_frames", 99999)
+    max_frames = args.max_frames or seq_info.get("n_frames", 999_999)
+    count = 0
 
     for data in seq:
-        if isinstance(data, tuple) or isinstance(data, list):
-            if len(data) == 2:
-                frame_idx, frame = data
-            else:
-                frame_idx = None
-                frame = data[-1]
+        if count >= max_frames:
+            break
+
+        if isinstance(data, (tuple, list)) and len(data) == 2:
+            frame_idx, frame = data
         else:
-            frame = data
-            frame_idx = None
+            frame_idx = count
+            frame = data if not isinstance(data, (tuple, list)) else data[-1]
 
         if frame is None:
             continue
 
-        box = tracker.track(frame)
-        box = [int(round(float(v))) for v in box]
+        box, conf = tracker.track(frame)
+        box_int   = [int(round(float(v))) for v in box]
+        csv_rows.append((f"{args.seq_id}_{frame_idx}", *box_int))
 
-        if frame_idx is None:
-            frame_idx = 0
+        fc    = tracker._frozen_count
+        color = (0,255,0) if fc==0 else ((0,165,255) if fc<FROZEN_LIMIT else (0,0,255))
+        vis   = draw_box(frame, box_int, color=color)
+        cv2.putText(vis, f"conf={conf:.2f} fr={fc}", (8, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-        csv_rows.append((f"{args.seq_id}_{frame_idx}", *box))
+        if save_video:
+            vout.write(vis)
+        count += 1
 
-        vis = draw_box(frame, box)
-        out.write(vis)
-
-    out.release()
+    if save_video and vout is not None:
+        vout.release()
     seq.release()
 
     with open(args.output, "w", newline="") as f:
@@ -232,7 +404,141 @@ def main():
         writer.writerow(["id", "x", "y", "w", "h"])
         writer.writerows(csv_rows)
 
-    print("✅ Done!")
+    print(f"Done — {len(csv_rows)} frames written to {args.output}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FIX: All-sequence runner — produces the full competition submission CSV
+# ──────────────────────────────────────────────────────────────────────────────
+def run_all_sequences(args, model):
+    """
+    Loop over every sequence in every split of the manifest and write one
+    unified submission.csv.  This is what the competition evaluator expects.
+
+    Pass --split all  (default) to process every split, or e.g. --split public_lb
+    to process only one split.
+    """
+    with open(args.manifest) as f:
+        manifest = json.load(f)
+
+    # Determine which splits to run
+    if args.split == "all":
+        splits_to_run = list(manifest.keys())
+    else:
+        splits_to_run = [args.split]
+
+    all_rows = []
+
+    for split_name in splits_to_run:
+        split_seqs = manifest.get(split_name, {})
+        if not isinstance(split_seqs, dict):
+            continue
+
+        seq_list = list(split_seqs.values())
+        print(f"\n[split={split_name}] {len(seq_list)} sequences")
+
+        for si, seq_info in enumerate(seq_list):
+            seq_id = f"{seq_info['dataset']}/{seq_info['seq_name']}"
+            print(f"  [{si+1}/{len(seq_list)}] {seq_id} ...")
+
+            try:
+                seq = InferenceSequence(seq_info, args.data_root)
+            except (FileNotFoundError, RuntimeError) as e:
+                print(f"    SKIP: {e}")
+                continue
+
+            # Re-initialise tracker for each sequence
+            tracker = HiFTTracker(model, args.device)
+            frame0, box0 = seq.get_init()
+            tracker.initialize(frame0, _box_floats(box0))
+
+            # First frame — use GT box
+            all_rows.append((f"{seq_id}_0",
+                              *[int(round(float(v))) for v in box0]))
+
+            max_frames = seq_info.get("n_frames", 999_999)
+            count = 0
+
+            for data in seq:
+                if count >= max_frames:
+                    break
+
+                if isinstance(data, (tuple, list)) and len(data) == 2:
+                    frame_idx, frame = data
+                else:
+                    frame_idx = count
+                    frame = data if not isinstance(data, (tuple, list)) else data[-1]
+
+                if frame is None:
+                    continue
+
+                box, _ = tracker.track(frame)
+                box_int = [int(round(float(v))) for v in box]
+                all_rows.append((f"{seq_id}_{frame_idx}", *box_int))
+                count += 1
+
+            seq.release()
+            print(f"    done ({count+1} frames)")
+
+    # Write unified CSV
+    with open(args.output, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "x", "y", "w", "h"])
+        writer.writerows(all_rows)
+
+    print(f"\nSubmission CSV written: {args.output}  ({len(all_rows)} total rows)")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="HiFT tracker — inference and submission generation"
+    )
+    p.add_argument("--checkpoint", required=True,
+                   help="Path to fine-tuned model checkpoint (.pth)")
+    p.add_argument("--manifest",
+                   default="data/contest_release/metadata/contestant_manifest.json")
+    p.add_argument("--data_root", default="data/contest_release")
+    p.add_argument("--output",    default="submission.csv")
+    p.add_argument("--device",    default="cuda")
+
+    # Mode selection
+    p.add_argument("--mode", choices=["single", "all"], default="all",
+                   help="'single': run one sequence (debug/visualise).  "
+                        "'all': run all sequences (competition submission).")
+
+    # Single-sequence options
+    p.add_argument("--seq_id",      default=None,
+                   help="Required when --mode single.  "
+                        "Format: dataset/seq_name")
+    p.add_argument("--video_output", default="",
+                   help="Path for visualisation video (single mode only).")
+    p.add_argument("--max_frames",  type=int, default=None)
+
+    # All-sequence options
+    p.add_argument("--split", default="all",
+                   help="Which manifest split to process in --mode all. "
+                        "Use 'all' to process every split (default).")
+
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    print(f"[load] HiFT on {args.device} ...")
+    model = HiFT().to(args.device)
+    model.load_pretrained(args.checkpoint, device=args.device)
+    model.eval()
+
+    if args.mode == "single":
+        if args.seq_id is None:
+            raise ValueError("--seq_id is required when --mode single")
+        run_single_sequence(args, model)
+    else:
+        run_all_sequences(args, model)
 
 
 if __name__ == "__main__":
