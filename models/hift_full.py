@@ -153,7 +153,10 @@ class TransformerEncoderLayer(nn.Module):
         )[0]
         src = src + self.dropout1(src2)
         src = self.norm1(src)
-        side = int(s ** 0.5)
+        # [FIX] Add assertion to catch non-square spatial dimensions early
+        # Without this, int(s**0.5) silently produces wrong side length
+        side = int(round(s ** 0.5))
+        assert side * side == s, f"Expected square spatial dim, got {s} (side={side})"
         src = self.cross_attn(
             src.view(b, c, side, side),
             srcc.contiguous().view(b, c, side, side)

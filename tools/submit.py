@@ -103,14 +103,16 @@ def decode_prediction(loc: torch.Tensor, cls2: torch.Tensor,
                       s_orig: float, ox1: float, oy1: float):
     """
     Decode HiFT output maps into a bounding box and confidence score.
-
-    FIX (v2):
-    - Previously took loc[0] as if it were shape [4], discarding spatial dims.
-    - Now:
-        1. Find the peak cell in the cls2 score map.
-        2. Sample the loc map at that cell using grid_sample (same as training).
-        3. Apply sigmoid to get normalised [cx,cy,w,h] in [0,1] crop coords.
-        4. Back-project to frame coords using s_orig and (ox1, oy1).
+    
+    [FIX v3] Replaced hard argmax with soft-argmax (spatial expectation).
+    
+    Hard argmax: picks single pixel → noisy when confidence map is flat.
+    Soft-argmax: weighted average of ALL pixels by confidence → smooth & stable.
+    
+    When cls2 is confident (peaked), soft≈hard.
+    When cls2 is uncertain (flat), soft returns center → safe fallback.
+    
+    Also fixes grid shape using torch.stack for consistency with training code.
 
     loc  : [1, 4, H, W]  raw logits from localization head
     cls2 : [1, 1, H, W]  raw logits from classification head
@@ -118,26 +120,34 @@ def decode_prediction(loc: torch.Tensor, cls2: torch.Tensor,
     ox1, oy1 : top-left of crop in ORIGINAL (pre-padding) frame coords
     """
     with torch.no_grad():
-        # ── Confidence: sigmoid on cls2, find peak ─────────────────────────
+        # ── Confidence: sigmoid on cls2 ───────────────────────────────────
         score_map = torch.sigmoid(cls2[0, 0]).cpu().float()   # [H, W]
         score_np  = score_map.numpy()
         conf      = float(score_np.max())
 
         H, W = score_np.shape
 
-        # ── Peak location in normalised [-1,1] for grid_sample ──────────────
-        flat_idx  = int(score_np.argmax())
-        peak_row  = flat_idx // W   # row index  (y direction)
-        peak_col  = flat_idx  % W   # col index  (x direction)
+        # [FIX] Soft-argmax: spatial expectation instead of hard argmax
+        # Normalize scores to sum=1 (softmax over spatial dims)
+        scores_flat = score_map.view(-1)                        # [H*W]
+        # Temperature=10 sharpens the distribution while keeping it differentiable
+        weights = torch.softmax(scores_flat * 10.0, dim=0)     # [H*W]
+        weights_2d = weights.view(H, W)                        # [H, W]
 
-        # Cell centre in [0,1] crop coords
-        cx_peak_n = (peak_col + 0.5) / W
-        cy_peak_n = (peak_row + 0.5) / H
+        # Coordinate grids in [0,1]
+        ys = (torch.arange(H).float() + 0.5) / H              # [H]
+        xs = (torch.arange(W).float() + 0.5) / W              # [W]
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij") # [H, W]
 
-        # Convert to grid_sample coords [-1, 1]
-        gx = torch.tensor(2.0 * cx_peak_n - 1.0).view(1, 1, 1, 1)
-        gy = torch.tensor(2.0 * cy_peak_n - 1.0).view(1, 1, 1, 1)
-        grid = torch.cat([gx, gy], dim=-1)                    # [1,1,1,2]
+        # Weighted average position (soft-argmax)
+        cx_peak_n = float((weights_2d * grid_x).sum())
+        cy_peak_n = float((weights_2d * grid_y).sum())
+
+        # ── Sample loc map at soft position ───────────────────────────────
+        # [FIX] Use stack+view for correct grid shape [B, 1, 1, 2]
+        gx = torch.tensor(2.0 * cx_peak_n - 1.0)
+        gy = torch.tensor(2.0 * cy_peak_n - 1.0)
+        grid = torch.stack([gx, gy], dim=-1).view(1, 1, 1, 2)
 
         # Sample loc at peak position: [1,4,H,W] → [1,4,1,1] → [4]
         loc_cpu = loc.cpu().float()
